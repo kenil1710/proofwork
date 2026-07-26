@@ -153,6 +153,42 @@ check("mixed",
 
 flat = lambda n: {k: n for k in pw.SCORE_KEYS}
 
+print("\n_is_usable_url — evidence present, or a word someone typed")
+for good in (
+    "https://github.com/acme/widget",
+    "http://example.com",
+    "https://widget.vercel.app/",
+    "https://figma.com/file/abc?node-id=1",
+    "https://sub.domain.co.uk/path#frag",
+    "https://user:pw@example.com/x",
+    "https://example.com:8443/x",
+    "https://192.168.1.10/status",
+    "  https://example.com  ",
+    "HTTPS://EXAMPLE.COM",
+):
+    check(f"usable: {good.strip()[:38]}", pw._is_usable_url(good), True)
+
+# Every one of these used to read as "evidence supplied". "nope" is the one
+# observed live: it flipped the weights to 25/25/25/25 and sent a screenshot
+# render at a non-URL, and the milestone settled UNDETERMINED.
+for bad in (
+    "none", "nope", "n/a", "N/A", "-", "", "   ", "\t",
+    "TBD", "no mockup", "null", "undefined", "0",
+    "github.com/acme/widget",       # no scheme
+    "www.example.com",              # no scheme
+    "ftp://example.com/x",          # scheme this contract cannot fetch
+    "javascript:alert(1)",
+    "file:///etc/passwd",
+    "http://",                      # no host
+    "https://",
+    "http://nope",                  # single bare label, not reachable
+    "http://localhost:3000",        # only the submitter can see it
+    "http://.com",                  # empty label
+    "https://example..com",
+    "https://example.com.",         # trailing dot
+):
+    check(f"absent: {bad.strip()[:38]!r}", pw._is_usable_url(bad), False)
+
 print("\n_parse_github_repo — URL shapes people actually paste")
 check("plain repo", pw._parse_github_repo("https://github.com/acme/widget"),
       {"owner": "acme", "repo": "widget", "branch": ""})
@@ -328,7 +364,7 @@ check("404 is NOT transient", pw._is_transient_status(404), False)
 check("200 is NOT transient", pw._is_transient_status(200), False)
 check("401 is NOT transient", pw._is_transient_status(401), False)
 
-print("\n_fetch_github_code — fails CLOSED, never silently degrades")
+print("\n_fetch_github_code — raw first, API only as a last resort")
 TREE = json.dumps({"tree": [
     {"type": "blob", "path": "README.md", "size": 100},
     {"type": "blob", "path": "main.py", "size": 100},
@@ -336,69 +372,230 @@ TREE = json.dumps({"tree": [
     {"type": "blob", "path": "src/extra.ts", "size": 100},
 ]}).encode()
 
-# A non-GitHub URL must never reach the API path — it returns "" so the caller
+# The probe list is ordered JS-first, so the ceiling must clear the whole list
+# plus the one README attempt. Below that it does not degrade gracefully: it
+# spends the budget missing on React paths and never reaches main.py, and every
+# Python/Go/Rust repo would score as though it contained no code.
+check("probe ceiling clears the whole list",
+      pw.MAX_RAW_PROBES >= 1 + len(pw.RAW_PROBE_PATHS), True)
+check(".jsx entrypoints are probed",
+      any(p.endswith(".jsx") for p in pw.RAW_PROBE_PATHS), True)
+# The listing walk must NOT share the speculative probe counter. If it did, a
+# repo whose README answered and whose every probe missed would arrive at the
+# listing with the budget spent and fetch nothing from it — README-only evidence,
+# which is the failure the listing exists to prevent.
+check("listing has its own budget",
+      pw.MAX_LISTING_FETCHES >= pw.MAX_SOURCE_FILES, True)
+check("one ref, no branch guessing", pw.GITHUB_DEFAULT_REF, "HEAD")
+
+# A non-GitHub URL must never reach either path — it returns "" so the caller
 # renders the page, and leader and validators all take that same branch.
 check("non-github short-circuits", pw._fetch_github_code("https://gitlab.com/a/b"), "")
 
-# Happy path: README + MAX_SOURCE_FILES source files, shallowest first.
-# Fixtures are multi-line on purpose: a file under MIN_SOURCE_LINES is treated
-# as generated, so one-liners here would test the minification rule by accident
-# rather than the happy path.
-_stub_routes([
-    ("api.github.com", _Resp(200, TREE)),
-    ("README.md", _Resp(200, b"# Widget\nDoes a thing.")),
-    ("main.py", _Resp(200, b"import sys\n\n\ndef main():\n    print('hi')\n")),
-    ("src/app.ts", _Resp(200, b"export const a = 1\nexport const b = 2\nexport const c = 3\n")),
-    ("src/extra.ts", _Resp(200, b"export const d = 4\nexport const e = 5\nexport const f = 6\n")),
+
+def _run_counting(routes, url="https://github.com/acme/widget"):
+    """Run a fetch and report how many api.github.com requests it made.
+
+    The metered surface is the only one that matters: raw is CDN-served and
+    unmetered, api.github.com is 60/hr per IP on shared validator egress.
+    """
+    calls = {"api": 0, "raw": 0}
+
+    def _get(u, headers=None):
+        calls["api" if "api.github.com" in u else "raw"] += 1
+        for fragment, response in routes:
+            if fragment in u:
+                return response
+        return _Resp(404, b"")
+
+    pw.gl.nondet.web = types.SimpleNamespace(get=_get)
+    try:
+        return pw._fetch_github_code(url), calls
+    except UserError as e:
+        return f"RAISED:{e.message}", calls
+
+
+PY_SRC = b"import sys\n\n\ndef main():\n    print('hi')\n"
+TS_SRC = b"export const a = 1\nexport const b = 2\nexport const c = 3\n"
+
+# Conventional repo: served entirely from raw, ZERO metered API calls. Every
+# raw URL carries the HEAD ref, which GitHub resolves to the default branch —
+# so these routes assert the ref as well as the content.
+code, calls = _run_counting([
+    ("/HEAD/README.md", _Resp(200, b"# Widget\nDoes a thing.")),
+    ("/HEAD/src/index.ts", _Resp(200, TS_SRC)),
+    ("/HEAD/main.py", _Resp(200, PY_SRC)),
 ])
-code = pw._fetch_github_code("https://github.com/acme/widget")
 check("README included", "// FILE: README.md" in code, True)
-check("shallowest source included", "// FILE: main.py" in code, True)
-check("second source included", "// FILE: src/app.ts" in code, True)
-check("budget capped at 2 files", "// FILE: src/extra.ts" in code, False)
+check("entrypoint included", "// FILE: src/index.ts" in code, True)
+check("second entrypoint included", "// FILE: main.py" in code, True)
+check("capped at 2 source files", code.count("// FILE:"), 3)
 check("real content reaches the prompt", "print('hi')" in code, True)
 check("no Response repr leaks in", "Response(" in code, False)
+check("ZERO api.github.com calls on the happy path", calls["api"], 0)
+
+# A Python repo must reach app.py despite the JS-first probe order.
+code, calls = _run_counting([
+    ("/HEAD/README.md", _Resp(200, b"# Tool\nA CLI.")),
+    ("/HEAD/app.py", _Resp(200, PY_SRC)),
+])
+check("python repo reaches app.py", "// FILE: app.py" in code, True)
+check("python repo needs no API call", calls["api"], 0)
+
+# The default branch is whatever the repo says it is. `main` and `master` were
+# guesses; HEAD is the answer. A repo defaulting to `blead`, `develop` or `trunk`
+# used to be unreachable by raw entirely — no branch name matched, so the branch
+# was never identified and every such repo fell through to the metered listing.
+code, calls = _run_counting([
+    ("/HEAD/README.md", _Resp(200, b"# Legacy\nOld.")),
+    ("/HEAD/main.go", _Resp(200, b"package main\n\nfunc main() {}\n")),
+])
+check("non-main default branch served via HEAD", "// FILE: main.go" in code, True)
+check("non-main default needs no API call", calls["api"], 0)
+
+# An explicit /tree/<branch> URL still pins that branch rather than HEAD — the
+# client linked a specific branch and that is the evidence they submitted.
+code, calls = _run_counting([
+    ("/develop/README.md", _Resp(200, b"# Feature branch")),
+    ("/develop/main.py", _Resp(200, PY_SRC)),
+], url="https://github.com/acme/widget/tree/develop")
+check("pinned branch overrides HEAD", "// FILE: main.py" in code, True)
+check("pinned branch needs no API call", calls["api"], 0)
+
+# FIX: a repo whose README is not spelled README.md. The branch used to be
+# identified by whichever name served README.md, so README.rst meant "no branch
+# found" and the whole repo was pushed onto the API path that 403s from
+# validator egress. Now the source is read directly and the missing README costs
+# only its own paragraph.
+code, calls = _run_counting([
+    ("/HEAD/README.rst", _Resp(200, b"Widget\n======\n")),
+    ("/HEAD/main.py", _Resp(200, PY_SRC)),
+])
+check("README.rst repo still yields source", "// FILE: main.py" in code, True)
+check("README.rst repo needs no API call", calls["api"], 0)
+
+# Same for a repo with no README at all: nothing about it blocks source probing.
+code, calls = _run_counting([
+    ("/HEAD/index.js", _Resp(200, b"const a = 1\nconst b = 2\nconst c = 3\n")),
+])
+check("README-less repo still yields source", "// FILE: index.js" in code, True)
+check("README-less repo needs no API call", calls["api"], 0)
+
+# No README and nothing at a guessed entrypoint -> ONE listing call. `main.py`
+# is deliberately left unrouted: it is in RAW_PROBE_PATHS, so serving it would
+# satisfy pass 1 and this fixture would stop exercising the listing at all.
+code, calls = _run_counting([
+    ("api.github.com", _Resp(200, TREE)),
+    ("/HEAD/src/app.ts", _Resp(200, TS_SRC)),
+    ("/HEAD/src/extra.ts", _Resp(200, TS_SRC)),
+])
+check("falls back to the listing", "// FILE: src/app.ts" in code, True)
+check("listing walks past the 404 to the next candidate",
+      "// FILE: src/extra.ts" in code, True)
+check("listing is capped at ONE call", calls["api"], 1)
+
+# The 403 that motivated all of this: unreachable API, but raw still serves.
+code, calls = _run_counting([
+    ("api.github.com", _Resp(403, b"rate limit exceeded")),
+    ("/HEAD/README.md", _Resp(200, b"# Widget\nDoes a thing.")),
+    ("/HEAD/main.py", _Resp(200, PY_SRC)),
+])
+check("API 403 is irrelevant when raw works", "// FILE: main.py" in code, True)
+check("API never even called", calls["api"], 0)
+
+print("\n_fetch_github_code — a README is not code (job 16)")
+# Django/Rails/Maven/monorepo/cmd-server layouts: a README at the root and no
+# source at any guessed path. The old gate was `not pieces`, so the README alone
+# satisfied it, the listing never ran, and the model was asked to score
+# code_quality having been shown nothing but prose — job 16 scored 0 there and
+# the milestone was rejected at 45 on evidence no validator ever saw.
+DJANGO_TREE = json.dumps({"tree": [
+    {"type": "blob", "path": "README.md", "size": 100},
+    {"type": "blob", "path": "manage.py", "size": 100},
+    {"type": "blob", "path": "shop/views.py", "size": 100},
+]}).encode()
+code, calls = _run_counting([
+    ("api.github.com", _Resp(200, DJANGO_TREE)),
+    ("/HEAD/README.md", _Resp(200, b"# Shop\nA Django storefront.")),
+    ("/HEAD/manage.py", _Resp(200, PY_SRC)),
+    ("/HEAD/shop/views.py", _Resp(200, PY_SRC)),
+], url="https://github.com/acme/shop")
+check("README alone no longer suppresses the listing", calls["api"], 1)
+check("unguessed source is reached", "// FILE: manage.py" in code, True)
+check("second unguessed file too", "// FILE: shop/views.py" in code, True)
+# The listing's _find_readme would otherwise re-fetch the same prose and spend
+# the budget on it twice.
+check("README not duplicated", code.count("// FILE: README.md"), 1)
+
+# The budget bug this created: the README answers, then all eleven probes miss,
+# so the speculative counter is spent by the time the listing runs. Sharing one
+# counter made the walk break on its first iteration and return the README
+# alone — reintroducing the exact failure through the back door.
+DEEP_TREE = json.dumps({"tree": [
+    {"type": "blob", "path": "packages/api/src/server.ts", "size": 100},
+]}).encode()
+code, calls = _run_counting([
+    ("api.github.com", _Resp(200, DEEP_TREE)),
+    ("/HEAD/README.md", _Resp(200, b"# Monorepo\nTurbo workspace.")),
+    ("/HEAD/packages/api/src/server.ts", _Resp(200, TS_SRC)),
+], url="https://github.com/acme/mono")
+check("exhausted probe budget does not starve the listing",
+      "// FILE: packages/api/src/server.ts" in code, True)
+
+# A README plus an unreadable listing must NOT be scored as code. Reverting is
+# retryable; scoring prose as code_quality rejects the milestone permanently.
+_stub_routes([
+    ("api.github.com", _Resp(403, b"rate limited")),
+    ("/HEAD/README.md", _Resp(200, b"# Shop\nA Django storefront.")),
+])
+try:
+    pw._fetch_github_code("https://github.com/acme/shop")
+    fails.append("README + 403 listing should have raised")
+    print("  FAIL README + 403 listing did not raise")
+except UserError as e:
+    assert e.message.startswith("[TRANSIENT]"), e.message
+    print(f"  ok   README + 403 -> {e.message[:34]}")
+
+# Source found on raw means the listing is never consulted, so a rate limit
+# there cannot turn a good submission into a revert.
+code, calls = _run_counting([
+    ("api.github.com", _Resp(403, b"rate limited")),
+    ("/HEAD/README.md", _Resp(200, b"# Widget")),
+    ("/HEAD/main.py", _Resp(200, PY_SRC)),
+])
+check("source on raw keeps the API out of it entirely", calls["api"], 0)
+
+MINIFIED = b"!function(){" + b"z" * 900 + b"}();"
 
 # An unmarked bundle is only detectable once fetched, so it must be skipped
-# past rather than filling a slot with one unreadable line.
-BUNDLE_TREE = json.dumps({"tree": [
-    {"type": "blob", "path": "README.md", "size": 100},
-    {"type": "blob", "path": "bundle.js", "size": 900},
-    {"type": "blob", "path": "src/app.ts", "size": 100},
-    {"type": "blob", "path": "src/util.ts", "size": 100},
-]}).encode()
-_stub_routes([
-    ("api.github.com", _Resp(200, BUNDLE_TREE)),
-    ("README.md", _Resp(200, b"# Widget")),
-    ("bundle.js", _Resp(200, b"!function(){" + b"z" * 900 + b"}();")),
-    ("src/app.ts", _Resp(200, b"export const a = 1\nexport const b = 2\nexport const c = 3\n")),
-    ("src/util.ts", _Resp(200, b"export const d = 4\nexport const e = 5\nexport const f = 6\n")),
-])
-code = pw._fetch_github_code("https://github.com/acme/bundled")
-check("bundle excluded from prompt", "// FILE: bundle.js" in code, False)
-check("real source used instead", "// FILE: src/app.ts" in code, True)
+# past rather than filling a slot with one unreadable line. Here the bundle sits
+# at a conventional entrypoint, so it is reached through the raw probe path.
+code, calls = _run_counting([
+    ("/HEAD/README.md", _Resp(200, b"# Widget\nDoes a thing.")),
+    ("/HEAD/src/index.js", _Resp(200, MINIFIED)),
+    ("/HEAD/main.py", _Resp(200, PY_SRC)),
+], url="https://github.com/acme/bundled")
+check("bundle excluded from prompt", "// FILE: src/index.js" in code, False)
+check("real source used instead", "// FILE: main.py" in code, True)
 check("no minified payload leaks in", "z" * 100 in code, False)
+check("skipping a bundle costs no API call", calls["api"], 0)
 
-# The spare attempt is exactly one: two bundles ahead of real source exhausts
-# MAX_FILE_FETCHES and the good file is never reached.
+# Every conventional entrypoint is a bundle, and there is no README, so raw
+# yields nothing and the listing runs. Its candidates are bundles too, except
+# the last — which the probe budget now comfortably reaches.
 TWO_BUNDLES = json.dumps({"tree": [
     {"type": "blob", "path": "a-bundle.js", "size": 900},
     {"type": "blob", "path": "b-bundle.js", "size": 900},
-    {"type": "blob", "path": "c-bundle.js", "size": 900},
     {"type": "blob", "path": "real.ts", "size": 100},
 ]}).encode()
-_stub_routes([
+code, calls = _run_counting([
     ("api.github.com", _Resp(200, TWO_BUNDLES)),
-    ("bundle.js", _Resp(200, b"!function(){" + b"z" * 900 + b"}();")),
+    ("bundle.js", _Resp(200, MINIFIED)),
     ("real.ts", _Resp(200, b"const a = 1\nconst b = 2\nconst c = 3\n")),
-])
-try:
-    out = pw._fetch_github_code("https://github.com/acme/allbundles")
-    check("budget is a hard stop, not best-effort", "// FILE: real.ts" in out, False)
-except UserError as e:
-    # Also acceptable: nothing showable was found at all.
-    assert e.message.startswith("[EXTERNAL]"), e.message
-    print("  ok   all-bundles repo -> EXTERNAL")
+], url="https://github.com/acme/allbundles")
+check("bundles skipped, real source still found", "// FILE: real.ts" in code, True)
+check("no bundle payload in the prompt", "z" * 100 in code, False)
+check("listing still capped at ONE call", calls["api"], 1)
 
 # 403 on the listing is GitHub rate-limiting a validator. It MUST raise, not
 # quietly fall back to rendering the landing page — that mismatch is what makes
@@ -442,18 +639,30 @@ try:
     fails.append("private repo should have raised")
 except UserError as e:
     assert e.message.startswith("[EXTERNAL]"), e.message
-    print(f"  ok   404 both    -> {e.message[:34]}")
+    # The advice must no longer name a branch: HEAD resolves whatever the
+    # default is, so "check the default branch is main or master" would send the
+    # client after a problem they do not have.
+    assert "master" not in e.message, e.message
+    print(f"  ok   404 all     -> {e.message[:34]}")
 
-# main 404s, master serves — the fallback branch must still work.
+# A pinned branch that does not exist is the one case where naming a branch is
+# the actual diagnosis, and both sides build the identical message from the URL
+# alone — required, since _compare_user_errors matches [EXTERNAL] exactly.
+try:
+    pw._fetch_github_code("https://github.com/acme/widget/tree/nope")
+    fails.append("missing pinned branch should have raised")
+except UserError as e:
+    assert "`nope`" in e.message, e.message
+    print(f"  ok   404 pinned  -> ...{e.message[-30:]}")
+
+# The listing is requested at the same single ref as every raw fetch, so leader
+# and validators walk one tree. A second `trees/<guess>` call cannot happen.
 _stub_routes([
-    ("trees/main", _Resp(404, b"Not Found")),
-    ("trees/master", _Resp(200, TREE)),
-    ("README.md", _Resp(200, b"# Old repo")),
-    ("main.py", _Resp(200, b"x = 1")),
-    ("src/app.ts", _Resp(200, b"y = 2")),
+    ("trees/HEAD", _Resp(200, TREE)),
+    ("main.py", _Resp(200, b"x = 1\ny = 2\nz = 3\n")),
 ])
-check("falls back to master branch",
-      "// FILE: README.md" in pw._fetch_github_code("https://github.com/acme/legacy"), True)
+check("listing uses the same ref as the fetches",
+      "// FILE: main.py" in pw._fetch_github_code("https://github.com/acme/legacy"), True)
 
 # Readable listing, nothing showable in it.
 _stub_routes([

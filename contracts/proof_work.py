@@ -388,6 +388,67 @@ Respond ONLY with a JSON object, no prose, no code fences:
 """
 
 
+def _is_usable_url(url: str) -> bool:
+    """Whether a submitted string is something a fetcher can actually open.
+
+    The old test was `url != "" and url != "none"`, which only ever caught the
+    one sentinel the UI happens to send. Anything else a freelancer typed into
+    the box — "nope", "n/a", "-", "TBD", a bare space — read as evidence
+    supplied. For a mockup that is not a harmless mistake: `has_mockup` flips
+    the weights to 25/25/25/25 and then the leader calls
+    `web.render(mode="screenshot")` on a string that is not a URL. Observed
+    live, a submission with `mockup_url="nope"` settled UNDETERMINED, so the
+    milestone could not be scored at all.
+
+    So the rule is positive rather than a blocklist: a scheme this contract can
+    fetch, and a host that could resolve. Everything else is absent, and the
+    weights fall through to the branch that does not depend on it.
+
+    The dot requirement rejects `http://nope`, which is well-formed but not
+    reachable from a validator. It also rejects `http://localhost/...`, which
+    is deliberate — a page only the freelancer can see is not evidence.
+    """
+    text = str(url).strip()
+    lowered = text.lower()
+
+    if lowered.startswith("https://"):
+        rest = text[len("https://"):]
+    elif lowered.startswith("http://"):
+        rest = text[len("http://"):]
+    else:
+        return False
+
+    # The authority is everything before the first path, query or fragment.
+    host = rest
+    for sep in ("/", "?", "#"):
+        cut = host.find(sep)
+        if cut != -1:
+            host = host[:cut]
+
+    # Drop userinfo and port — neither is part of the host name.
+    at = host.rfind("@")
+    if at != -1:
+        host = host[at + 1:]
+    colon = host.rfind(":")
+    if colon != -1:
+        host = host[:colon]
+
+    host = host.strip()
+    if not host:
+        return False
+
+    # A reachable host is dotted: `example.com`, `1.2.3.4`. A single bare label
+    # is either an intranet name or somebody's typo.
+    if "." not in host:
+        return False
+    # No empty labels — catches "http://.com", "http://example..com" and a
+    # trailing dot typo.
+    for label in host.split("."):
+        if not label:
+            return False
+    return True
+
+
 def _normalize(text: str) -> str:
     """Collapse whitespace so trivial formatting drift between two fetches of
     the same page does not read as a different page."""
@@ -424,9 +485,30 @@ def _fingerprint(text: str) -> str:
 # by dict ordering or wall clock would make honest validators disagree with an
 # honest leader.
 
-GITHUB_BRANCHES = ("main", "master")
-"""Tried in order. Two attempts rather than a discovery call — the request
-count on this path is paid by the leader AND by every validator."""
+GITHUB_DEFAULT_REF = "HEAD"
+"""The ref used whenever the submitted URL does not pin one.
+
+Both `raw.githubusercontent.com/<owner>/<repo>/HEAD/<path>` and
+`/git/trees/HEAD` resolve to whatever the repository's default branch actually
+is. Verified live against a repository whose default is neither of the names
+this code used to guess: `Perl/perl5` (default `blead`) serves `/HEAD/README`
+and 404s on `/main/README`.
+
+This replaces guessing `main` then `master`, which cost two things. It spent a
+probe per candidate before any source could be fetched, and — worse — it needed
+some file known to exist on every candidate in order to tell which name was
+live. That file was hardcoded `README.md`, so a repository with `README.rst`, a
+lowercase `readme.markdown`, or no README at all was judged to have no
+identifiable branch and fell through to the metered listing API, which returns
+403 from the shared egress addresses validators actually run on.
+
+One symbolic ref removes the guess, the extra probe, and that whole class of
+false negative — and covers `develop`, `trunk` and any renamed default that a
+two-name guess never could.
+
+Deterministic across validators: GitHub resolves the ref server-side from the
+same repository state every side reads, so the leader and the validators fetch
+byte-identical content and their fingerprints match."""
 
 SOURCE_EXTENSIONS = (
     # Scripting, server-side, data
@@ -471,6 +553,17 @@ README_CHARS = 800
 """The README states intent, so it earns a slice of the budget — but only a
 slice. Letting prose crowd out source is exactly how the old path failed."""
 
+README_PATH = "README.md"
+"""The one README name probed speculatively, for context only.
+
+Nothing hinges on finding it any more — the ref is resolved by `HEAD` and the
+source probes below run whether or not it answered. So a miss costs a paragraph
+of intent, not the evaluation: a `README.rst` repository still gets its source
+files read, and if no source is found at all the listing pass locates any
+`readme*` by name via `_find_readme`. Probing further spellings here would spend
+a sequential CDN round trip per spelling on every repository that has none, to
+recover prose that is explicitly capped at a quarter of the budget."""
+
 SKIP_DIRS = (
     "node_modules", "dist", "build", "vendor", "target", "out",
     "coverage", ".git", "__pycache__", ".next", "venv", ".venv",
@@ -489,12 +582,54 @@ MAX_SOURCE_LINE_CHARS = 500
 MIN_SOURCE_LINES = 3
 """Fewer lines than this and there is nothing to review."""
 
-MAX_FILE_FETCHES = 3
-"""Raw fetches allowed to fill `MAX_SOURCE_FILES` slots.
+RAW_PROBE_PATHS = (
+    "src/App.jsx", "src/App.tsx", "src/main.jsx", "src/main.tsx",
+    "src/index.ts", "src/index.js", "src/main.rs",
+    "main.py", "app.py", "index.js", "main.go",
+)
+"""Where an entrypoint conventionally lives, tried in order.
 
-One spare. Minification can only be judged after the file is in hand, so
-without an allowance a single bundle would silently cost a slot — but a
-generous allowance would undo the rate-limit budget, so it is exactly one."""
+Guessing beats asking. `api.github.com` meters at 60 requests per hour per IP
+and validator nodes share busy egress addresses, so the listing call returns
+403 on the nodes that matter even when it succeeds from a developer's laptop.
+`raw.githubusercontent.com` is served from the CDN and carries no such limit,
+so a handful of speculative 404s against raw costs nothing that a single
+metered API call does not cost more."""
+
+MAX_RAW_PROBES = 12
+"""Ceiling on the speculative raw requests, counting the misses.
+
+Raw is unmetered, so this bounds latency rather than quota: each probe is a
+sequential round trip inside the leader's budget, and a CDN hit is tens of
+milliseconds against a verification that already pays for two screenshots and
+an LLM call and is measured in minutes. Twelve cheap misses are cheaper than one
+screenshot, which is why the ceiling is not lower.
+
+Sized to clear one README probe plus every entry in `RAW_PROBE_PATHS` exactly,
+which is load-bearing rather than slack. `RAW_PROBE_PATHS` is ordered JS-first,
+so a lower ceiling does not degrade gracefully — it spends the whole budget
+missing on React paths and never reaches `main.py`, and every Python, Go and
+Rust repository silently scores as though it contained no code. A cap that
+truncates the probe list is worse than no cap at all.
+
+Resolving the ref through `HEAD` rather than guessing `main` then `master` is
+what freed the probe this used to spend on a second README attempt."""
+
+MAX_LISTING_FETCHES = 6
+"""Ceiling on the file fetches made while walking a listing, counted separately
+from `MAX_RAW_PROBES`.
+
+The two budgets measure different things and must not share a counter. A raw
+probe is a guess that is *expected* to miss; a listing walk fetches paths GitHub
+has confirmed exist, and only overspends when the shallowest ones turn out to be
+unmarked bundles that `_looks_minified` rejects after the fetch.
+
+Sharing one counter was a live bug the moment the listing stopped being reachable
+only from a standing start: a repository whose README answered and whose eleven
+probes all missed arrived at the listing with the budget already exhausted, so
+the walk broke on its first iteration and the model was handed the README alone
+— the precise outcome the listing exists to prevent. Six clears four bundles and
+still funds both source slots."""
 
 
 def _parse_github_repo(url: str) -> dict:
@@ -747,59 +882,22 @@ def _fetch_github_code(github_url: str) -> str:
     owner = str(repo["owner"])
     name = str(repo["repo"])
     pinned = str(repo["branch"])
-    branches = (pinned,) if pinned else GITHUB_BRANCHES
 
-    tree = None
-    branch = ""
-    for candidate in branches:
-        result = _web_get(
-            f"https://api.github.com/repos/{owner}/{name}"
-            f"/git/trees/{candidate}?recursive=1",
-            GITHUB_HEADERS,
-        )
-        status = int(result["status"])
+    # A `/tree/<branch>/` URL pins the branch the client actually linked; with
+    # nothing pinned, `HEAD` resolves the repository's real default. Either way
+    # there is exactly ONE ref, settled before the first request and never
+    # revised by what a fetch happened to return — see `GITHUB_DEFAULT_REF`.
+    ref = pinned if pinned else GITHUB_DEFAULT_REF
 
-        if _is_transient_status(status):
-            raise gl.vm.UserError(
-                f"{ERROR_TRANSIENT} GitHub returned {status} listing "
-                f"{owner}/{name}; the evidence was not read. Verify again."
-            )
-        if status != 200:
-            # 404 — that branch does not exist. Try the next name.
-            continue
+    def _raw(path: str) -> str:
+        """One file from raw.githubusercontent.com, whole.
 
-        try:
-            parsed = json.loads(result["body"])
-        except Exception:
-            raise gl.vm.UserError(
-                f"{ERROR_TRANSIENT} GitHub returned an unreadable listing for "
-                f"{owner}/{name}. Verify again."
-            )
-        if isinstance(parsed, dict) and isinstance(parsed.get("tree"), list):
-            tree = parsed["tree"]
-            branch = candidate
-            break
-
-    if tree is None:
-        # Every branch name 404'd. Deterministic: the repository is private,
-        # renamed, or on a branch this contract does not look for.
-        raise gl.vm.UserError(
-            f"{ERROR_EXTERNAL} Could not read {owner}/{name} on GitHub. "
-            f"Check the repository is public and its default branch is "
-            f"{' or '.join(GITHUB_BRANCHES)}."
-        )
-
-    pieces = []
-    used = 0
-
-    def _fetch_file(path: str) -> str:
-        """One raw file, whole. Raises on transient, returns "" on a plain 404.
-
-        Returns the file untruncated so the caller can judge it before the
-        budget cuts it down — see `_looks_minified`.
+        Raises on transient, returns "" on a plain 404. Untruncated so the
+        caller can judge it before the budget cuts it down — see
+        `_looks_minified`.
         """
         got = _web_get(
-            f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}",
+            f"https://raw.githubusercontent.com/{owner}/{name}/{ref}/{path}",
             RAW_HEADERS,
         )
         code = int(got["status"])
@@ -812,34 +910,34 @@ def _fetch_github_code(github_url: str) -> str:
             return ""
         return str(got["body"])
 
-    readme_path = _find_readme(tree)
-    if readme_path:
-        # No minification check here: the README is prose, not a source slot,
-        # and a one-line README is perfectly normal.
-        body = _fetch_file(readme_path)
-        if body:
-            chunk = f"// FILE: {readme_path}\n{body[:README_CHARS]}"
-            pieces.append(chunk)
-            used += len(chunk)
-
+    pieces = []
+    used = 0
     accepted = 0
-    attempts = 0
-    for path in _rank_source_files(tree):
-        if accepted >= MAX_SOURCE_FILES or attempts >= MAX_FILE_FETCHES:
+    probes = 0
+    have_readme = False
+
+    # ── Pass 1: raw, by convention ──
+    #
+    # The README is fetched for context and is not a gate: whether it answers or
+    # 404s, the source probes below run against the same already-settled ref.
+    probes += 1
+    body = _raw(README_PATH)
+    if body:
+        chunk = f"// FILE: {README_PATH}\n{body[:README_CHARS]}"
+        pieces.append(chunk)
+        used += len(chunk)
+        have_readme = True
+
+    for path in RAW_PROBE_PATHS:
+        if accepted >= MAX_SOURCE_FILES or probes >= MAX_RAW_PROBES:
             break
         room = CODE_TEXT_CHARS - used
         if room <= 0:
             break
 
-        # Counted before the call, so a 404 spends its attempt too — it cost a
-        # request either way, which is what the budget is measuring.
-        attempts += 1
-        body = _fetch_file(path)
-        if not body:
-            continue
-        if _looks_minified(body):
-            # Skip to the next candidate rather than filling a slot with a
-            # single 40,000-character line.
+        probes += 1
+        body = _raw(path)
+        if not body or _looks_minified(body):
             continue
 
         chunk = f"// FILE: {path}\n{body}"[:room]
@@ -847,14 +945,97 @@ def _fetch_github_code(github_url: str) -> str:
         used += len(chunk)
         accepted += 1
 
+    # ── Pass 2: the listing API, only when convention found no SOURCE ──
+    #
+    # The gate is `accepted == 0`, NOT an empty `pieces`. A README is not code.
+    # Gating on `pieces` meant any repository that had a README but kept its
+    # source somewhere the probe list does not guess was declared complete on
+    # the strength of its prose, and the model was asked for a `code_quality`
+    # score having been shown no code — which is job 16: functionality 72,
+    # completeness 68, code_quality 0, rejected at 45, on evidence no validator
+    # ever saw. Django (`<app>/views.py`), Rails (`app/models/`), Maven
+    # (`src/main/java/...`), pnpm/turbo monorepos (`packages/*/src/`) and Go's
+    # `cmd/server/main.go` all land there, so this was not an edge case.
+    #
+    # ONE call. This is the expensive path in the only sense that matters:
+    # api.github.com meters at 60 requests per hour per IP, and validator nodes
+    # share busy egress addresses, so in practice it returns 403 regardless of
+    # how little this contract asks of it. raw.githubusercontent.com is not
+    # subject to that limit, which is why every request above prefers it.
+    if accepted == 0:
+        result = _web_get(
+            f"https://api.github.com/repos/{owner}/{name}"
+            f"/git/trees/{ref}?recursive=1",
+            GITHUB_HEADERS,
+        )
+        status = int(result["status"])
+
+        if status == 200:
+            try:
+                parsed = json.loads(result["body"])
+            except Exception:
+                parsed = None
+
+            if isinstance(parsed, dict) and isinstance(parsed.get("tree"), list):
+                tree = parsed["tree"]
+
+                # Only when pass 1 did not already supply one, or a repository
+                # holding both `README.md` and `README.rst` would spend a fetch
+                # and a chunk of the budget on the same prose twice.
+                if not have_readme:
+                    readme_path = _find_readme(tree)
+                    if readme_path:
+                        body = _raw(readme_path)
+                        if body:
+                            chunk = f"// FILE: {readme_path}\n{body[:README_CHARS]}"
+                            pieces.append(chunk)
+                            used += len(chunk)
+                            have_readme = True
+
+                fetches = 0
+                for path in _rank_source_files(tree):
+                    if accepted >= MAX_SOURCE_FILES or fetches >= MAX_LISTING_FETCHES:
+                        break
+                    room = CODE_TEXT_CHARS - used
+                    if room <= 0:
+                        break
+
+                    fetches += 1
+                    body = _raw(path)
+                    if not body or _looks_minified(body):
+                        continue
+
+                    chunk = f"// FILE: {path}\n{body}"[:room]
+                    pieces.append(chunk)
+                    used += len(chunk)
+                    accepted += 1
+
+        elif _is_transient_status(status):
+            # No source was read by either route, so there is nothing to score
+            # `code_quality` against and the call must not proceed. Raising here
+            # can now discard a README that pass 1 did fetch, and that is the
+            # point: reverting a verification is retryable, whereas scoring
+            # prose as code rejects a milestone permanently and wrongly.
+            #
+            # The cost is that a leader who reaches the listing while a
+            # validator is rate-limited gets a mismatch — the validator raises
+            # while the leader succeeded — and the transaction reverts for the
+            # caller to retry. That trade is deliberate: a retry costs time, a
+            # false rejection costs the freelancer the milestone.
+            raise gl.vm.UserError(
+                f"{ERROR_TRANSIENT} GitHub returned {status} listing "
+                f"{owner}/{name}, and no source file could be read directly. "
+                f"Verify again."
+            )
+
     if not pieces:
-        # The listing was readable but held nothing this contract can show a
-        # model. Deterministic, so validators agree — and far more honest than
-        # handing the prompt an empty repository and letting it score the
-        # silence.
+        # Every route came back a clean 404. Deterministic, so validators agree
+        # — and far more honest than handing the prompt an empty repository and
+        # letting the model score the silence.
         raise gl.vm.UserError(
-            f"{ERROR_EXTERNAL} No README or recognised source files found in "
-            f"{owner}/{name}."
+            f"{ERROR_EXTERNAL} Could not read any file from {owner}/{name}. "
+            f"Check the repository is public"
+            + (f" and that branch `{pinned}` exists." if pinned else ".")
         )
 
     return "\n\n".join(pieces)[:CODE_TEXT_CHARS]
@@ -1247,9 +1428,19 @@ class ProofWork(gl.Contract):
         mockup_url = str(ms_mem.mockup_url)
 
         # ── Determine which checks apply based on evidence provided ──
-        has_code = github_url != "" and github_url != "none"
-        has_site = site_url != "" and site_url != "none"
-        has_mockup = mockup_url != "" and mockup_url != "none"
+        #
+        # A URL counts as supplied only if it is fetchable — see
+        # `_is_usable_url`. Testing against the "none" sentinel alone let any
+        # stray word through, and an unfetchable mockup does not merely score
+        # badly: it weights design at 25% and then sends a screenshot render at
+        # a string that is not a URL, which is how a live submission with
+        # `mockup_url="nope"` settled UNDETERMINED.
+        #
+        # Deterministic, and computed before the nondet block, so every
+        # validator classifies the same submission the same way.
+        has_code = _is_usable_url(github_url)
+        has_site = _is_usable_url(site_url)
+        has_mockup = _is_usable_url(mockup_url)
 
         if not has_code and not has_site:
             raise gl.vm.UserError(
