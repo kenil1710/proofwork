@@ -1,0 +1,12 @@
+{
+  "name": "proofwork-test",
+  "private": true,
+  "type": "module",
+  "description": "Integration harness for the ProofWork contract on Bradbury testnet.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "genlayer-js": "^1.1.8"
+  }
+}

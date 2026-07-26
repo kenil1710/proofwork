@@ -1,0 +1,37 @@
+# macOS
+.DS_Store
+
+# Node — frontend/.gitignore covers the app itself; this catches any stray installs.
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python (contracts/, test/)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Env — never commit real values. Templates are opted back in below.
+.env
+.env.*
+!.env.example
+
+# GenLayer — keystores live in ~/.genlayer, but guard against a stray copy.
+# These hold private keys; they must never reach version control.
+*.keystore
+keystore*.json
+
+# Throwaway funded testnet keypairs generated for the integration suite.
+# Regenerate with test/README.md rather than committing them.
+test/.accounts.json
+
+# Editors
+.idea/
+.vscode/
+*.swp

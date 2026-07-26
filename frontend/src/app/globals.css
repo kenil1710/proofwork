@@ -1,0 +1,618 @@
+@import "tailwindcss";
+
+/* Tailwind 4 wires `dark:` to prefers-color-scheme by default. Rebind it to a
+   class so a future theme toggle can flip `.dark` on <html> and win over the
+   OS setting. The app ships dark-first (see layout.tsx). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* ── Type ─────────────────────────────────────────────────────────────────
+     ONE family for everything a person reads — headings, body, buttons,
+     labels, form fields. There is no display face: a pixel/CRT font was tried
+     here and removed, because it made every title harder to read to buy an
+     aesthetic the colour and the borders already deliver.
+
+     Mono is not a style in this system, it is a signal. It means "this is a
+     machine-emitted value you may need to compare character by character":
+     contract addresses, transaction hashes, chain ids, code. Applying it to a
+     heading or a button spends that signal on decoration and leaves a real
+     address indistinguishable from a label. ── */
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SFMono-Regular", monospace;
+
+  /* ── Palette, sampled from the Spline ribbon-sphere scene ─────────────────
+     Not chosen by eye. The published scene was rendered headless, its canvas
+     pixels bucketed by hue with the pale background and letterbox excluded,
+     and the three families below are what the ribbons are actually made of:
+
+       hue 300  #b04dab → #e56de5 → #ff79ff   the hot magenta ribbon (dominant)
+       hue 260  #632ec2 → #6e3cdc → #8a42ff   the violet ribbon
+       hue 250  #0c0037 → #17074e             the deep indigo it sits in
+
+     So: orchid is the accent, violet is its partner in every gradient, and the
+     neutrals are built from that indigo rather than from a cold slate — which
+     is what makes the page look like it belongs under the sphere instead of
+     merely hosting it. ── */
+
+  /* Accent. Links, focus, active nav, primary actions, card ignition. */
+  --color-orchid-50: #fdf0fb;
+  --color-orchid-100: #fbdcf8;
+  --color-orchid-200: #f7bdf2;
+  --color-orchid-300: #f091ea;
+  --color-orchid-400: #e56de5;
+  --color-orchid-500: #d355d4;
+  --color-orchid-600: #b83fb8;
+  --color-orchid-700: #8f2f8f;
+
+  /* Partner hue. Gradient fills and secondary emphasis. */
+  --color-violet-200: #d5c4ff;
+  --color-violet-300: #a98bff;
+  --color-violet-400: #8a42ff;
+  --color-violet-500: #6e3cdc;
+  --color-violet-600: #5a2fbb;
+  --color-violet-700: #462494;
+
+  /* ── Accent: emerald. Verified milestones, payouts, positive deltas.
+        Kept green on purpose — "passed" is not a brand colour, and the accent
+        moving to magenta finally frees green to mean only that. ── */
+  --color-accent-50: #ecfdf5;
+  --color-accent-100: #d1fae5;
+  --color-accent-200: #a7f3d0;
+  --color-accent-300: #6ee7b7;
+  --color-accent-400: #34d399;
+  --color-accent-500: #10b981;
+  --color-accent-600: #059669;
+  --color-accent-700: #047857;
+  --color-accent-800: #065f46;
+  --color-accent-900: #064e3b;
+
+  /* ── Surfaces ─────────────────────────────────────────────────────────────
+     READ THIS BEFORE ADDING A STEP. These numbers are **roles, not
+     lightnesses**, and the scale inverts between themes:
+
+        950 = page        900 = card       850 = raised / hover
+        800 = border      700 = strong border
+        600 = muted text  400 = body text  300 = strong text  100 = heading
+
+     In dark, 950 is nearly black and 100 nearly white. In light they swap
+     ends. That is what lets one set of utilities serve both themes without a
+     single `dark:` variant in any of the 26 components — the values below are
+     redefined wholesale under `.light` further down this file. So never pick a
+     step by how bright it looks; pick it by the role it plays.
+
+     Dark values carry a violet cast lifted from the ribbon sphere's shadow
+     (#17074e) rather than being neutral grey: a slate page under a magenta
+     sphere reads as two unrelated pieces. ── */
+  --color-surface-950: #0b0715;
+  --color-surface-900: #130d24;
+  --color-surface-850: #191231;
+  --color-surface-800: #241a41;
+  --color-surface-700: #3b2d5e;
+  --color-surface-600: #6c5f8c;
+  --color-surface-400: #9f95b8;
+  --color-surface-300: #c9c2da;
+  --color-surface-100: #f1edf8;
+
+  /* Chrome that is not a plain surface step. Navbar and footer differ per
+     theme by more than one token, so they get their own. */
+  --color-chrome-nav: #0b0715;
+  --color-chrome-footer: #0b0715;
+  /* Backdrop for code blocks — must stay distinct from both page and card. */
+  --color-chrome-code: #080511;
+  /* Neutral elevation. Zero in dark (the finish is matte); light needs a
+     little, or white cards on off-white have no edge at all. */
+  --shadow-raise: 0 0 #0000;
+
+  /* ── Job / milestone status. Mirrors the contract's status strings.
+        "Open" is cyan rather than the old blue: against violet-tinted cards a
+        blue badge and the violet accent went muddy at small sizes. ── */
+  --color-status-open: #2bb8ea;        /* open        — cyan    */
+  --color-status-progress: #f59e0b;    /* in_progress — amber   */
+  --color-status-verified: #10b981;    /* verified    — emerald */
+  --color-status-rejected: #ef4444;    /* rejected    — red     */
+  --color-status-cancelled: #6c5f8c;   /* cancelled   — muted   */
+
+  /* ── Score bands. Match the contract's payout thresholds:
+        90+ full payout, 80+ pays 80%, 70+ pays 70%, <70 rejected. ── */
+  --color-score-high: #10b981;   /* 90-100 */
+  --color-score-good: #2bb8ea;   /* 80-89  */
+  --color-score-fair: #f59e0b;   /* 70-79  */
+  --color-score-fail: #ef4444;   /* 0-69   */
+
+  /* ── Motion. One easing for the whole product: a gentle decelerate that
+        settles rather than snaps, which is the difference between "smooth"
+        and "fast". Durations scale with how far a thing moves. ── */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+
+  /* ── Radii. The scene's own CTA is a full pill and its ribbons have no hard
+        corners anywhere; square edges were the previous terminal register and
+        they fought it. ── */
+  --radius-card: 16px;
+  --radius-control: 10px;
+}
+
+/* ── Light theme ────────────────────────────────────────────────────────────
+   The same token names with the scale turned end for end. Every utility in the
+   app resolves through these, so this block is the entire light mode — there
+   are no `dark:` variants anywhere in the components.
+
+   Warm neutrals, not cold greys: the accent is magenta, and a blue-grey light
+   theme under a magenta gradient looks like two different products, which is
+   the exact mistake the dark theme already avoids in the other direction. */
+.light {
+  color-scheme: light;
+
+  --color-surface-950: #faf9f7; /* page  — warm off-white */
+  --color-surface-900: #ffffff; /* card  — pure white     */
+  --color-surface-850: #f3f1ed; /* raised / hover         */
+  --color-surface-800: #e6e2db; /* border                 */
+  --color-surface-700: #d3cdc4; /* strong border          */
+  --color-surface-600: #8b8279; /* muted text             */
+  --color-surface-400: #57514a; /* body text              */
+  --color-surface-300: #2f2b26; /* strong text            */
+  --color-surface-100: #0a0a0a; /* headings               */
+
+  --color-chrome-nav: #ffffff;
+  --color-chrome-footer: #f3f1ed;
+  --color-chrome-code: #f7f5f2;
+  --shadow-raise: 0 1px 2px rgba(23, 20, 17, 0.04),
+    0 8px 24px -12px rgba(23, 20, 17, 0.1);
+
+  /* Accent, darkened for type. #e56de5 is a 2.3:1 contrast on white — fine as
+     a fill, unreadable as a link. Fills (500/600) keep their saturation so the
+     gradient button is identical in both themes; the steps used for TEXT are
+     pulled down until they pass. Hover goes darker here, not lighter, which is
+     why 300 sits below 400 in this block and above it in dark. */
+  --color-orchid-200: #7c1f7c;
+  --color-orchid-300: #8a218a;
+  --color-orchid-400: #a3299f;
+
+  /* Status hues need more depth on white to stay legible at badge sizes. */
+  --color-status-open: #0e7fa8;
+  --color-status-progress: #b45309;
+  --color-status-verified: #047857;
+  --color-status-rejected: #c62828;
+  --color-status-cancelled: #6b6259;
+
+  --color-score-high: #047857;
+  --color-score-good: #0e7fa8;
+  --color-score-fair: #b45309;
+  --color-score-fail: #c62828;
+
+  /* Emerald means "verified" in both themes, but its dark-theme steps wash out
+     on white, so the ones used as ink move down the ramp. */
+  --color-accent-300: #047857;
+  --color-accent-400: #047857;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-surface-950);
+    color: var(--color-surface-100);
+    font-family: var(--font-sans);
+    /* Theme swaps are a deliberate user action, so they get a short
+       cross-fade rather than a hard cut. Page-level only — individual
+       components must not animate colour on load. */
+    transition:
+      background-color 220ms var(--ease-out-soft),
+      color 220ms var(--ease-out-soft);
+  }
+
+  /* Keyboard focus stays visible against dark surfaces, in the accent so the
+     ring belongs to the same system as every other interactive affordance. */
+  :focus-visible {
+    outline: 2px solid var(--color-orchid-400);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* The live-network dot. Ambient, so it yields to reduced-motion. */
+  @keyframes proofwork-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+
+  .animate-pulse-dot {
+    animation: proofwork-pulse 2.4s ease-in-out infinite;
+  }
+
+  /* ── Cards ────────────────────────────────────────────────────────────────
+     MATTE. No bloom, no coloured shadow, no ring — the finish is flat
+     throughout, and depth comes from a solid fill sitting on a darker page,
+     not from light. Hover shifts the fill up one step and warms the border
+     toward orchid. That is the entire effect, and it is deliberately quiet. */
+  .card {
+    border: 1px solid var(--color-surface-800);
+    border-radius: var(--radius-card);
+    background-color: var(--color-surface-900);
+    /* Zero in dark, a soft neutral lift in light — a white card on off-white
+       has no edge otherwise. Neutral, never accent-tinted: a coloured shadow
+       is the glow this finish dropped. */
+    box-shadow: var(--shadow-raise);
+    transition:
+      border-color 320ms var(--ease-out-soft),
+      background-color 320ms var(--ease-out-soft);
+  }
+
+  .card:hover,
+  .card:focus-within {
+    border-color: color-mix(
+      in oklab,
+      var(--color-orchid-400) 40%,
+      var(--color-surface-800)
+    );
+    background-color: var(--color-surface-850);
+  }
+
+  /* ── Panel ────────────────────────────────────────────────────────────────
+     A surface for content that is read, not clicked: definition grids, score
+     breakdowns, callouts. Same flat language as a card, but inert — nothing
+     here responds to a pointer, so nothing here reacts to one. */
+  .panel {
+    border: 1px solid var(--color-surface-800);
+    border-radius: var(--radius-card);
+    background-color: color-mix(
+      in oklab,
+      var(--color-surface-900) 80%,
+      transparent
+    );
+    box-shadow: var(--shadow-raise);
+  }
+
+  /* ── Chrome ───────────────────────────────────────────────────────────────
+     Navbar and footer differ between themes by more than one surface step, so
+     they read their own tokens instead of borrowing one. */
+  .chrome-nav {
+    background-color: color-mix(
+      in oklab,
+      var(--color-chrome-nav) 85%,
+      transparent
+    );
+  }
+
+  .chrome-footer {
+    background-color: var(--color-chrome-footer);
+  }
+
+  /* Code has to look like code in both themes — on the light page an
+     off-white block against an off-white page would vanish, so it takes a
+     tinted backdrop of its own rather than the page colour. */
+  .chrome-code {
+    background-color: var(--color-chrome-code);
+  }
+
+  /* Panel that is itself the subject. Distinguished by a warmer border and a
+     faint accent-tinted fill — not by a glow. */
+  .panel-live {
+    border: 1px solid
+      color-mix(in oklab, var(--color-orchid-400) 22%, transparent);
+    border-radius: var(--radius-card);
+    background-color: color-mix(
+      in oklab,
+      var(--color-orchid-500) 5%,
+      var(--color-surface-900)
+    );
+  }
+
+  /* ── Scroll reveal ────────────────────────────────────────────────────────
+     Applied by <Reveal>. The element starts displaced and transparent; adding
+     `.reveal-in` settles it. Transition rather than keyframes so an element
+     already in view on load can be shown instantly with no animation frame. */
+  .reveal {
+    opacity: 0;
+    transform: translateY(16px);
+    transition:
+      opacity 750ms var(--ease-out-soft),
+      transform 750ms var(--ease-out-soft);
+  }
+
+  .reveal-in {
+    opacity: 1;
+    transform: none;
+  }
+
+  /* Score bars grow from zero once the verdict "computes". */
+  .bar-fill {
+    transition: width 1100ms var(--ease-out-soft);
+  }
+
+  /* ── Ambient motion ───────────────────────────────────────────────────────
+     Decorative and `aria-hidden` at every call site: none of it may carry
+     meaning, because motion is invisible to a screen reader and unreliable
+     for anyone who has turned it off. */
+
+  /* Opacity pulse for the live-network indicator. */
+  @keyframes proofwork-breathe {
+    0%,
+    100% {
+      opacity: 0.35;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.75;
+      transform: scale(1.06);
+    }
+  }
+
+  .animate-breathe {
+    animation: proofwork-breathe 3.6s ease-in-out infinite;
+  }
+
+  /* ── Glow ─────────────────────────────────────────────────────────────────
+     Two intensities. `-soft` is for resting state, `-hard` for hover and the
+     hero headline. Both are additive over dark surfaces only. */
+  /* ── Controls ─────────────────────────────────────────────────────────────
+     Rounded, sentence-case, and lightly tracked. The previous revision was
+     uppercase with wide tracking, which is a terminal mannerism — the scene's
+     own CTA is a soft pill with ordinary casing, and matching it is most of
+     what makes the page read as premium rather than technical. */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid transparent;
+    border-radius: var(--radius-control);
+    padding: 0.7rem 1.4rem;
+    font-family: var(--font-sans);
+    font-size: 0.9375rem;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+    transition:
+      background-color 260ms var(--ease-out-soft),
+      border-color 260ms var(--ease-out-soft),
+      box-shadow 260ms var(--ease-out-soft),
+      transform 260ms var(--ease-out-soft),
+      color 260ms var(--ease-out-soft);
+  }
+
+  /* Primary is a flat magenta→violet fill, the sphere's own gradient. A
+     gradient is pigment, not light — it stays matte because nothing is cast
+     beyond the button's own edges. No shadow, no lift. */
+  .btn-primary {
+    border-color: transparent;
+    background-image: linear-gradient(
+      110deg,
+      var(--color-orchid-500) 0%,
+      var(--color-violet-500) 100%
+    );
+    color: #fff;
+  }
+
+  .btn-primary:hover {
+    background-image: linear-gradient(
+      110deg,
+      var(--color-orchid-400) 0%,
+      var(--color-violet-400) 100%
+    );
+  }
+
+  .btn-ghost {
+    border-color: var(--color-surface-700);
+    color: var(--color-surface-300);
+  }
+
+  .btn-ghost:hover {
+    border-color: color-mix(
+      in oklab,
+      var(--color-orchid-400) 50%,
+      var(--color-surface-700)
+    );
+    color: var(--color-surface-100);
+    background-color: var(--color-surface-850);
+  }
+
+  /* Destructive: cancel a job, remove a milestone. Red is reserved for actions
+     that destroy state — it is never used for mere emphasis. */
+  .btn-danger {
+    border-color: color-mix(
+      in oklab,
+      var(--color-status-rejected) 45%,
+      transparent
+    );
+    color: var(--color-status-rejected);
+  }
+
+  .btn-danger:hover {
+    border-color: var(--color-status-rejected);
+    background-color: color-mix(
+      in oklab,
+      var(--color-status-rejected) 12%,
+      transparent
+    );
+  }
+
+  /* Compact variant for controls sitting inside a card or a table row, where
+     the full padding would dominate the thing it acts on. */
+  .btn-sm {
+    padding: 0.45rem 0.95rem;
+    font-size: 0.8125rem;
+  }
+
+  .btn:disabled,
+  .btn[aria-disabled="true"] {
+    cursor: not-allowed;
+    opacity: 0.4;
+    box-shadow: none;
+  }
+
+  /* Disabled must not keep the hover response — an element that lifts and
+     brightens but refuses to act is worse than one that looks plainly
+     unavailable. */
+  .btn:disabled:hover,
+  .btn[aria-disabled="true"]:hover {
+    transform: none;
+    box-shadow: none;
+    filter: none;
+    background-color: transparent;
+  }
+
+  .btn-primary:disabled:hover,
+  .btn-primary[aria-disabled="true"]:hover {
+    background-image: linear-gradient(
+      110deg,
+      var(--color-orchid-500) 0%,
+      var(--color-violet-500) 100%
+    );
+  }
+
+  /* ── Fields ───────────────────────────────────────────────────────────────
+     Rounded, sans, and lit from the accent on focus. Width is deliberately NOT
+     set here: a base that carried `w-full` beat every narrower override at the
+     call site, because class order in the attribute does not decide precedence
+     — stylesheet order does. Callers set their own width. */
+  .input {
+    border: 1px solid var(--color-surface-700);
+    border-radius: var(--radius-control);
+    background-color: color-mix(
+      in oklab,
+      var(--color-surface-950) 70%,
+      transparent
+    );
+    padding: 0.6rem 0.85rem;
+    color: var(--color-surface-100);
+    font-family: var(--font-sans);
+    font-size: 0.9375rem;
+    transition:
+      border-color 260ms var(--ease-out-soft),
+      box-shadow 260ms var(--ease-out-soft),
+      background-color 260ms var(--ease-out-soft);
+  }
+
+  /* Fields that take a machine value — a wallet address, a hash. Mono here is
+     doing the same job it does in a readout: making a mistyped character
+     visible. */
+  .input-mono {
+    font-family: var(--font-mono);
+    font-size: 0.875rem;
+    letter-spacing: -0.01em;
+  }
+
+  .input::placeholder {
+    color: var(--color-surface-600);
+  }
+
+  /* Focus is a flat 2px accent border, not a soft ring: a blurred halo is the
+     glow language this finish drops, and a solid edge is easier to see anyway.
+     The border thickens rather than adding an outline so the field does not
+     shift by a pixel when focused. */
+  .input:focus {
+    outline: none;
+    border-color: var(--color-orchid-400);
+    box-shadow: inset 0 0 0 1px var(--color-orchid-400);
+    background-color: var(--color-surface-950);
+  }
+
+  /* A field the form has already rejected. Border only — the message beside it
+     carries the reason, since colour alone is not an error report. */
+  .input-invalid {
+    border-color: color-mix(
+      in oklab,
+      var(--color-status-rejected) 60%,
+      transparent
+    );
+  }
+
+  /* ── Page titles ──────────────────────────────────────────────────────────
+     One rule so every page's h1 is the same object. Sans, semibold, and
+     optically tightened: a grotesque set at 2–3rem needs negative tracking or
+     it reads loose, which is the giveaway of type that was scaled rather than
+     designed. */
+  .title-display {
+    font-family: var(--font-sans);
+    font-size: clamp(1.875rem, 1.2rem + 2.6vw, 3rem);
+    font-weight: 600;
+    line-height: 1.08;
+    letter-spacing: -0.025em;
+  }
+
+  /* Hero scale. Same family, heavier, tighter still — at 5rem+ the tracking
+     has to come in further or the words drift apart. */
+  .title-hero {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    line-height: 1.02;
+    letter-spacing: -0.04em;
+  }
+
+  /* ── Machine values ───────────────────────────────────────────────────────
+     The one sanctioned use of mono outside code: addresses, hashes, chain ids.
+     Bundled with tabular figures and a slight negative tracking, because
+     Geist Mono's default spacing is generous for a 42-character hex string. */
+  .value-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.01em;
+  }
+
+  /* ── Status badge ─────────────────────────────────────────────────────────
+     A soft pill. Colour comes from the caller via the status tokens; this only
+     fixes the shape, so a badge can never pick up the interactive bloom that
+     the accent owns. Sentence case, not uppercase — at 11px, tracked caps in a
+     pill is the loudest thing on a job card, and the status is not the most
+     important thing on it. */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    border: 1px solid;
+    border-radius: 999px;
+    padding: 0.2rem 0.7rem;
+    font-family: var(--font-sans);
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: -0.005em;
+  }
+
+  /* ── Eyebrow ──────────────────────────────────────────────────────────────
+     The small kicker above a page title. Lives here so the tracking stays
+     identical across pages instead of drifting between 0.15em and 0.3em by
+     hand, as it had. */
+  .eyebrow {
+    font-family: var(--font-sans);
+    font-size: 0.75rem;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+  }
+
+  /* ── Section rhythm ───────────────────────────────────────────────────────
+     One vertical measure for every major band on every page, so scrolling the
+     site has a steady pulse instead of each page inventing its own spacing. */
+  .section-y {
+    padding-block: clamp(4rem, 3rem + 6vw, 7rem);
+  }
+
+  /* ── Reduced motion ───────────────────────────────────────────────────────
+     Covers every motion utility above. Reveals must still end visible — an
+     unreached transition would leave content permanently hidden, which is a
+     correctness bug, not a style preference. Hover transforms are dropped too:
+     a lift is motion, and someone who turned motion off did not mean "except
+     on hover". */
+  @media (prefers-reduced-motion: reduce) {
+    .animate-pulse-dot,
+    .animate-breathe {
+      animation: none;
+    }
+
+    .reveal {
+      opacity: 1;
+      transform: none;
+      transition: none;
+    }
+
+    .bar-fill {
+      transition: none;
+    }
+
+  }
+}
