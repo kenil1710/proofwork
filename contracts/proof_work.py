@@ -239,7 +239,7 @@ def _find_json(text: str) -> object:
     return candidate if isinstance(candidate, dict) else None
 
 
-def _extract_scores(reply: object) -> dict:
+def _extract_scores(reply: object, weights: dict) -> dict:
     """
     Pull all four scores out of whatever the model actually returned.
 
@@ -247,6 +247,9 @@ def _extract_scores(reply: object) -> dict:
     defaulting to zero: a zero is a permanent rejection of someone's work, and
     "the model was chatty" is not a reason to refuse to pay. The prefix makes
     validators disagree, which rotates onto a model that will answer properly.
+
+    `weights` decides how a *missing* axis is treated, which is why it has to be
+    passed in rather than inferred. See the branch below.
     """
     if isinstance(reply, dict):
         parsed: object = reply
@@ -266,9 +269,28 @@ def _extract_scores(reply: object) -> dict:
                 raw = parsed[alias]
                 break
         if raw is None:
-            # An axis the model left out scores zero. That is safe because an
-            # axis only reaches the final score if it carries weight, and it
-            # only carries weight when its evidence was supplied.
+            weight = int(weights.get(key, 0))
+
+            # An axis the model left out scores zero ONLY when it carries no
+            # weight — there, zero is multiplied by zero and cannot move the
+            # result.
+            #
+            # When the axis DOES carry weight, zero is not a safe default: it
+            # is the freelancer paying for the model's omission. On a
+            # full-evidence job a reply of 95/95/95 with design_match missing
+            # rolls up to 71, which pays the 70% band instead of 100% — a
+            # quarter of the milestone lost to a formatting slip, and nothing
+            # in the receipt would say why.
+            #
+            # So raise with the LLM prefix instead. `_compare_user_errors`
+            # never counts an [LLM_ERROR] as agreement, so validators disagree
+            # and the set rotates onto a model that answers properly. Retrying
+            # is cheap; a wrong payout is permanent.
+            if weight > 0:
+                raise gl.vm.UserError(
+                    f"{ERROR_LLM} Model omitted {key}, which carries "
+                    f"{weight}% of this milestone's score"
+                )
             scores[key] = 0
             continue
         try:
@@ -384,6 +406,460 @@ def _fingerprint(text: str) -> str:
     return _normalize(text)[:EVIDENCE_FINGERPRINT_CHARS]
 
 
+# ── GitHub source retrieval ──────────────────────────────────────────────────
+#
+# `web.render(repo_url, mode="text")` returns the repository LANDING PAGE — nav
+# chrome, the file listing, the star count, part of the README. Not one line of
+# source ever reached the prompt, so `code_quality` was unscoreable on every
+# code job on the platform.
+#
+# Confirmed live on Studionet job 16: a real submission scored functionality 72
+# and completeness 68, but code_quality 0, and was rejected at 45 — on evidence
+# the model was never shown. The freelancer was refused payment for code no
+# validator had read.
+#
+# So fetch actual file content through the API instead. Every step below is
+# deterministic given the same repository state, which is load-bearing: the
+# validators run this too and compare fingerprints, so a selection that varied
+# by dict ordering or wall clock would make honest validators disagree with an
+# honest leader.
+
+GITHUB_BRANCHES = ("main", "master")
+"""Tried in order. Two attempts rather than a discovery call — the request
+count on this path is paid by the leader AND by every validator."""
+
+SOURCE_EXTENSIONS = (
+    # Scripting, server-side, data
+    ".py", ".rb", ".php", ".sh", ".sql",
+    # JS/TS and single-file component formats
+    ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte",
+    # Markup and styles — a front-end milestone may be almost entirely these
+    ".html", ".css",
+    # Compiled and systems languages
+    ".java", ".cs", ".c", ".h", ".cpp", ".hpp", ".go", ".rs",
+    ".swift", ".kt", ".scala", ".dart",
+    # On-chain
+    ".sol",
+)
+"""What counts as reviewable source.
+
+Deliberately broad. A narrow list does not merely miss files — it makes
+`_fetch_github_code` raise `[EXTERNAL] No README or recognised source files`
+and reject the submission outright, so every extension left out is a whole
+category of freelance work the platform silently refuses. The first version of
+this list held eight entries and would have turned away any Java, PHP, Ruby,
+C#, C++, Swift, Kotlin, Vue or Svelte deliverable."""
+
+MAX_SOURCE_FILES = 2
+"""Ceiling on source-file fetches, so the content budget is README + 2 files.
+
+Deliberately small. GitHub allows 60 unauthenticated requests per hour per IP,
+and this path is paid by the leader AND by every validator in the set — which
+may share egress. At 3 content fetches plus the listing that is 4 requests per
+evaluation in the common case, so an IP supports roughly a dozen verifications
+an hour. It was 3 files (6 requests worst case), which halved that headroom for
+one extra file the 3000-character budget usually could not fit anyway."""
+
+MAX_FILE_BYTES = 50000
+"""Skip anything larger. A vendored bundle or a generated client would spend
+the whole character budget on code nobody wrote."""
+
+CODE_TEXT_CHARS = 3000
+"""Total code budget handed to the prompt. Unchanged from the render path."""
+
+README_CHARS = 800
+"""The README states intent, so it earns a slice of the budget — but only a
+slice. Letting prose crowd out source is exactly how the old path failed."""
+
+SKIP_DIRS = (
+    "node_modules", "dist", "build", "vendor", "target", "out",
+    "coverage", ".git", "__pycache__", ".next", "venv", ".venv",
+)
+"""Matched per path SEGMENT, never as a substring — a bare `in` test would
+also drop `webbuild/app.ts`, which is somebody's actual source."""
+
+SKIP_FILENAMES = (
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock",
+    "poetry.lock", "go.sum", "composer.lock",
+)
+
+MAX_SOURCE_LINE_CHARS = 500
+"""A line longer than this is minifier output, not something a person typed."""
+
+MIN_SOURCE_LINES = 3
+"""Fewer lines than this and there is nothing to review."""
+
+MAX_FILE_FETCHES = 3
+"""Raw fetches allowed to fill `MAX_SOURCE_FILES` slots.
+
+One spare. Minification can only be judged after the file is in hand, so
+without an allowance a single bundle would silently cost a slot — but a
+generous allowance would undo the rate-limit budget, so it is exactly one."""
+
+
+def _parse_github_repo(url: str) -> dict:
+    """
+    owner / repo / branch out of a GitHub URL, or `{}` if it is not one.
+
+    Accepts `github.com/owner/repo`, a trailing `.git`, trailing slashes, and
+    `/tree/<branch>/...` paths. Anything else returns `{}` and the caller falls
+    back to rendering the page, so a GitLab or self-hosted URL still works.
+    """
+    text = str(url).strip()
+    lowered = text.lower()
+
+    for prefix in ("https://", "http://"):
+        if lowered.startswith(prefix):
+            text = text[len(prefix):]
+            lowered = lowered[len(prefix):]
+            break
+    if lowered.startswith("www."):
+        text = text[4:]
+        lowered = lowered[4:]
+    if not lowered.startswith("github.com/"):
+        return {}
+    text = text[len("github.com/"):]
+
+    # Drop query and fragment before splitting, or `?tab=readme` becomes part
+    # of the repo name.
+    for sep in ("?", "#"):
+        cut = text.find(sep)
+        if cut != -1:
+            text = text[:cut]
+
+    parts = []
+    for piece in text.split("/"):
+        if piece:
+            parts.append(piece)
+    if len(parts) < 2:
+        return {}
+
+    owner = parts[0]
+    repo = parts[1]
+    if repo.lower().endswith(".git"):
+        repo = repo[:-4]
+    if not owner or not repo:
+        return {}
+
+    # `/tree/<branch>` pins the branch explicitly. Anything deeper is a path
+    # inside it, which is ignored — the tree call walks the whole repo anyway.
+    branch = ""
+    if len(parts) >= 4 and parts[2] == "tree":
+        branch = parts[3]
+
+    return {"owner": owner, "repo": repo, "branch": branch}
+
+
+def _is_source_path(path: str) -> bool:
+    """Whether a tree entry is source worth showing the model."""
+    lowered = path.lower()
+    if not lowered.endswith(SOURCE_EXTENSIONS):
+        return False
+
+    segments = lowered.split("/")
+    name = segments[-1]
+    if name in SKIP_FILENAMES:
+        return False
+    # `.min.` catches site.min.css and app.min.js before a request is spent on
+    # them. Bundles without the marker are caught by `_looks_minified` after
+    # the fetch, which is the only way to know.
+    if ".min." in name:
+        return False
+    for directory in segments[:-1]:
+        if directory in SKIP_DIRS:
+            return False
+    return True
+
+
+def _looks_minified(text: str) -> bool:
+    """Whether a fetched file is generated output rather than written source.
+
+    Judged on content because the filename cannot be trusted: `bundle.js` and
+    `vendor.css` carry no `.min.` marker and are exactly the files most likely
+    to be machine-generated.
+
+    Two signals, both cheap. A very long line is what a minifier produces, and
+    a file with almost no lines has nothing in it to review. Either one costs a
+    source slot to a single unreadable string in front of the model that
+    decides whether somebody gets paid.
+
+    Must be called on the WHOLE file, before the character budget truncates it
+    — a long, perfectly ordinary file cut to its first two lines would
+    otherwise look minified on the strength of our own truncation.
+    """
+    if not text.strip():
+        return True
+
+    lines = text.splitlines()
+    if len(lines) < MIN_SOURCE_LINES:
+        return True
+    for line in lines:
+        if len(line) > MAX_SOURCE_LINE_CHARS:
+            return True
+    return False
+
+
+def _rank_source_files(entries: list) -> list:
+    """
+    The source files worth showing, best first.
+
+    Sorted by depth then path so that the leader and every validator pick the
+    same files from the same tree. Files nearer the root come first: those are
+    the entry points and the code someone actually wrote, while depth usually
+    means generated, vendored or peripheral.
+    """
+    candidates = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "blob":
+            continue
+
+        path = str(entry.get("path", ""))
+        if not path or not _is_source_path(path):
+            continue
+
+        try:
+            if int(entry.get("size", 0)) > MAX_FILE_BYTES:
+                continue
+        except Exception:
+            continue
+
+        candidates.append((path.count("/"), path))
+
+    candidates.sort()
+
+    ranked = []
+    for _depth, path in candidates:
+        ranked.append(path)
+    return ranked
+
+
+def _find_readme(entries: list) -> str:
+    """Path of the shallowest README, or "" when the repo has none."""
+    best = ""
+    best_depth = -1
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "blob":
+            continue
+
+        path = str(entry.get("path", ""))
+        if not path:
+            continue
+        if not path.lower().split("/")[-1].startswith("readme"):
+            continue
+
+        depth = path.count("/")
+        if best_depth == -1 or depth < best_depth or (depth == best_depth and path < best):
+            best = path
+            best_depth = depth
+    return best
+
+
+GITHUB_HEADERS = {
+    # GitHub's REST API returns 403 to any request without a User-Agent, so
+    # this is required rather than polite.
+    "User-Agent": "ProofWork-IntelligentContract",
+    "Accept": "application/vnd.github+json",
+}
+
+RAW_HEADERS = {
+    # raw.githubusercontent.com serves plain files and must NOT be sent the
+    # API's Accept header — asking for `vnd.github+json` on a .py file is a
+    # good way to be handed something that is not the file.
+    "User-Agent": "ProofWork-IntelligentContract",
+}
+
+
+def _web_get(url: str, headers: dict) -> dict:
+    """
+    One bounded GET, as `{"status": int, "body": str}`.
+
+    `web.get` hands back a `Response` dataclass — `status`, `headers`, and a
+    `body` of BYTES — not a string. Stringifying the response object itself
+    would quietly yield its repr, and the model would then be asked to review
+    `Response(status=200, ...)` as though it were somebody's source code. So
+    the status is read and the body decoded explicitly.
+
+    The status is returned rather than folded into "" because the callers must
+    tell "404, that branch does not exist" from "403, GitHub is rate-limiting
+    this validator". Those need opposite handling: one is a fact every
+    validator sees alike, the other is a reason to stop and retry.
+
+    `status` 0 means the request never completed at all.
+    """
+    try:
+        response = gl.nondet.web.get(url, headers=headers)
+        status = int(response.status)
+        body = response.body
+        if body is None:
+            text = ""
+        elif isinstance(body, bytes):
+            # `replace` rather than strict: a stray non-UTF-8 byte in one file
+            # must not take down the whole evaluation.
+            text = body.decode("utf-8", "replace")
+        else:
+            text = str(body)
+        return {"status": status, "body": text}
+    except Exception:
+        return {"status": 0, "body": ""}
+
+
+def _is_transient_status(status: int) -> bool:
+    """Whether a status means "ask again" rather than "this is the answer".
+
+    0 is a request that never completed. 403 is what GitHub returns for the
+    unauthenticated rate limit — it does not use 429 for that, though 429 is
+    included for the proxies that do. 5xx is GitHub's problem, not the
+    submission's.
+
+    Everything else, 404 included, is a fact about the repository that every
+    validator observes identically and can safely act on.
+    """
+    return status == 0 or status == 403 or status == 429 or status >= 500
+
+
+def _fetch_github_code(github_url: str) -> str:
+    """
+    Real source out of a GitHub repository: the README plus the first couple of
+    source files, each under a `// FILE:` header so the model can tell them
+    apart.
+
+    Fails CLOSED. There is deliberately no fall back to rendering the page from
+    here, because this runs on the leader *and* on every validator: if one side
+    reached the API and another was rate-limited into rendering the landing
+    page instead, the two would fingerprint entirely different content and the
+    validator would reject honest evidence — reading as a dishonest leader
+    rather than as the network problem it is.
+
+    So a transient failure raises `[TRANSIENT]`, which `_compare_user_errors`
+    treats as agreement when both sides hit one, and the whole verification
+    reverts cleanly for the caller to retry. A 404 is different: every
+    validator sees it identically, so it raises `[EXTERNAL]`, which must match
+    exactly and does.
+    """
+    repo = _parse_github_repo(github_url)
+    if not repo:
+        return ""
+
+    owner = str(repo["owner"])
+    name = str(repo["repo"])
+    pinned = str(repo["branch"])
+    branches = (pinned,) if pinned else GITHUB_BRANCHES
+
+    tree = None
+    branch = ""
+    for candidate in branches:
+        result = _web_get(
+            f"https://api.github.com/repos/{owner}/{name}"
+            f"/git/trees/{candidate}?recursive=1",
+            GITHUB_HEADERS,
+        )
+        status = int(result["status"])
+
+        if _is_transient_status(status):
+            raise gl.vm.UserError(
+                f"{ERROR_TRANSIENT} GitHub returned {status} listing "
+                f"{owner}/{name}; the evidence was not read. Verify again."
+            )
+        if status != 200:
+            # 404 — that branch does not exist. Try the next name.
+            continue
+
+        try:
+            parsed = json.loads(result["body"])
+        except Exception:
+            raise gl.vm.UserError(
+                f"{ERROR_TRANSIENT} GitHub returned an unreadable listing for "
+                f"{owner}/{name}. Verify again."
+            )
+        if isinstance(parsed, dict) and isinstance(parsed.get("tree"), list):
+            tree = parsed["tree"]
+            branch = candidate
+            break
+
+    if tree is None:
+        # Every branch name 404'd. Deterministic: the repository is private,
+        # renamed, or on a branch this contract does not look for.
+        raise gl.vm.UserError(
+            f"{ERROR_EXTERNAL} Could not read {owner}/{name} on GitHub. "
+            f"Check the repository is public and its default branch is "
+            f"{' or '.join(GITHUB_BRANCHES)}."
+        )
+
+    pieces = []
+    used = 0
+
+    def _fetch_file(path: str) -> str:
+        """One raw file, whole. Raises on transient, returns "" on a plain 404.
+
+        Returns the file untruncated so the caller can judge it before the
+        budget cuts it down — see `_looks_minified`.
+        """
+        got = _web_get(
+            f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}",
+            RAW_HEADERS,
+        )
+        code = int(got["status"])
+        if _is_transient_status(code):
+            raise gl.vm.UserError(
+                f"{ERROR_TRANSIENT} GitHub returned {code} fetching {path}; "
+                f"the evidence was not read. Verify again."
+            )
+        if code != 200:
+            return ""
+        return str(got["body"])
+
+    readme_path = _find_readme(tree)
+    if readme_path:
+        # No minification check here: the README is prose, not a source slot,
+        # and a one-line README is perfectly normal.
+        body = _fetch_file(readme_path)
+        if body:
+            chunk = f"// FILE: {readme_path}\n{body[:README_CHARS]}"
+            pieces.append(chunk)
+            used += len(chunk)
+
+    accepted = 0
+    attempts = 0
+    for path in _rank_source_files(tree):
+        if accepted >= MAX_SOURCE_FILES or attempts >= MAX_FILE_FETCHES:
+            break
+        room = CODE_TEXT_CHARS - used
+        if room <= 0:
+            break
+
+        # Counted before the call, so a 404 spends its attempt too — it cost a
+        # request either way, which is what the budget is measuring.
+        attempts += 1
+        body = _fetch_file(path)
+        if not body:
+            continue
+        if _looks_minified(body):
+            # Skip to the next candidate rather than filling a slot with a
+            # single 40,000-character line.
+            continue
+
+        chunk = f"// FILE: {path}\n{body}"[:room]
+        pieces.append(chunk)
+        used += len(chunk)
+        accepted += 1
+
+    if not pieces:
+        # The listing was readable but held nothing this contract can show a
+        # model. Deterministic, so validators agree — and far more honest than
+        # handing the prompt an empty repository and letting it score the
+        # silence.
+        raise gl.vm.UserError(
+            f"{ERROR_EXTERNAL} No README or recognised source files found in "
+            f"{owner}/{name}."
+        )
+
+    return "\n\n".join(pieces)[:CODE_TEXT_CHARS]
+
+
 def _gather_evidence(github_url: str, site_url: str) -> dict:
     """
     Fetch the text evidence. No LLM — this is the half a validator can afford.
@@ -395,7 +871,20 @@ def _gather_evidence(github_url: str, site_url: str) -> dict:
     code_text = ""
     site_text = ""
     if github_url:
-        code_text = str(gl.nondet.web.render(github_url, mode="text"))[:3000]
+        # The two paths are chosen by the URL alone, never by whether a fetch
+        # succeeded. That is what keeps the leader and every validator on the
+        # SAME path for the same submission: a fallback triggered by failure
+        # would put a rate-limited validator on `render` while the leader used
+        # the API, and the resulting fingerprint mismatch would look like a
+        # lying leader instead of a busy network.
+        if _parse_github_repo(github_url):
+            code_text = _fetch_github_code(github_url)
+        else:
+            # Not GitHub — GitLab, Bitbucket, a self-hosted forge. Render the
+            # page, which is what every side does here, so they still agree.
+            code_text = str(gl.nondet.web.render(github_url, mode="text"))[
+                :CODE_TEXT_CHARS
+            ]
     if site_url:
         site_text = str(gl.nondet.web.render(site_url, mode="text"))[:2000]
 
@@ -459,7 +948,7 @@ def _gather_and_score(
     else:
         reply = gl.nondet.exec_prompt(prompt, response_format="json")
 
-    scores = _extract_scores(reply)
+    scores = _extract_scores(reply, weights)
 
     # Carry the evidence fingerprint out with the scores. Not the page text —
     # that would bloat the value that goes through consensus and gets stored.
@@ -716,6 +1205,21 @@ class ProofWork(gl.Contract):
         key = f"{job_id}:{milestone_id}"
         ms = self.milestones[key]
 
+        # The job's status, not just the milestone's. `abandon_job` refunds the
+        # escrow and moves the job to "abandoned" without touching individual
+        # milestones, so one left sitting in "submitted" stayed verifiable
+        # against money that had already gone back to the client:
+        # `total_amount` is never zeroed, so the payout branch below would fire
+        # against an escrow that no longer exists, push `paid_out` past
+        # `total_amount`, and — if it happened to be the last milestone — flip
+        # the job from "abandoned" back to "completed" and return the stake the
+        # client had already been paid.
+        #
+        # Checked first because it is the cheaper and more fundamental of the
+        # two: a milestone's state is only meaningful while its job is live.
+        if job.status != "in_progress":
+            raise gl.vm.UserError("Job is not in progress")
+
         if ms.status != "submitted":
             raise gl.vm.UserError("Milestone not submitted for review")
 
@@ -893,6 +1397,30 @@ class ProofWork(gl.Contract):
             if int(stake_back) > 0:
                 job.freelancer_stake = u64(0)
                 _Payee(job.freelancer).emit_transfer(value=u256(int(stake_back)))
+
+            # Return what the score bands left behind.
+            #
+            # A milestone scoring 70-89 releases only 70% or 80% of its share,
+            # and until now the remainder had no way out at all: `abandon_job`
+            # requires an unverified milestone and `cancel_job` requires an
+            # open job, so the moment the last milestone verified, 10-30% of
+            # the escrow was locked in this contract permanently — on the
+            # ordinary happy path of a job that was merely good rather than
+            # excellent. It belongs to the client, who never agreed to pay for
+            # work the contract itself decided was worth less.
+            #
+            # `paid_out` is raised to the full escrow BEFORE the transfer, the
+            # same ordering as the stake above, so the remainder can never be
+            # released twice by a later read of the field.
+            #
+            # This also sweeps the truncation dust from the divide-before-
+            # multiply payout arithmetic, so a job that scored 90+ throughout
+            # still settles to exactly zero rather than leaving a few base
+            # units behind.
+            remainder = int(job.total_amount) - int(job.paid_out)
+            if remainder > 0:
+                job.paid_out = u64(int(job.total_amount))
+                _Payee(job.client).emit_transfer(value=u256(remainder))
 
             # Update freelancer reputation
             addr_str = str(job.freelancer)
