@@ -1356,6 +1356,26 @@ failures a retry can actually fix, and never on the ones it makes worse":
 So a quota refusal raises `[TRANSIENT]` on the first response and the caller
 retries the whole verification later, when the window has actually moved."""
 
+MIN_EVIDENCE_PCT = 50
+"""How much of what was ATTEMPTED must come back before a score is meaningful.
+
+Below this the submission is not scored at all — `_fetch_github_code` raises
+and the milestone stays `submitted`. That distinction is the whole point: a low
+score REJECTS a milestone and pays nothing, permanently, and doing that because
+half the repository would not download punishes the freelancer for a fact about
+GitHub. A revert costs a retry.
+
+Measured against files attempted, never against the plan's slot count. The
+budget stops the loop early on a repository of large files — four 6000-character
+files fill the small plan's 24000 and eighteen slots go unused — and that is the
+plan working, not evidence going missing. Counting unfilled slots as failures
+would raise "insufficient evidence" on exactly the repositories that gave us the
+most to read.
+
+A file that arrives and turns out to be minified counts as attempted and
+unread, which is right: a vendored bundle is not reviewable source, and a
+repository that is mostly bundles genuinely cannot be judged from its code."""
+
 MAX_TREE_ENTRIES = 40000
 """Ceiling on tree entries walked when ranking.
 
@@ -2303,7 +2323,8 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
     """
     repo = _parse_github_repo(github_url)
     if not repo:
-        return {"text": "", "inventory": "", "kind": "", "planned": 0, "read": 0}
+        return {"text": "", "inventory": "", "kind": "", "planned": 0,
+                "attempted": 0, "read": 0}
 
     # What this milestone is about, in its own words. Derived here rather than
     # passed in pre-computed so the leader and every validator run the SAME
@@ -2478,6 +2499,7 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
     # ── Pass 2: implementation, ranked against this milestone ─────────────────
     ranked = _rank_source_files(tree, tokens, extensions, subpath, named)
     planned = slots if slots < len(ranked) else len(ranked)
+    attempted = 0
 
     for path in ranked:
         if accepted >= slots or fetches >= fetch_cap:
@@ -2491,6 +2513,7 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
             continue
 
         fetches += 1
+        attempted += 1
         body = _raw(path)
         if not body or _looks_minified(body):
             continue
@@ -2526,19 +2549,37 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
             used += _add(path, body, room, per_file)
             taken += 1
 
-    if not pieces:
-        # Every route came back a clean 404. Deterministic, so validators agree
-        # — and far more honest than handing the prompt an empty repository and
-        # letting the model score the silence.
-        #
-        # Tested BEFORE the note is attached, or a repository whose only readable
-        # file was a scaffold README would return the note as its evidence: a
-        # non-empty `code_text` holding no code at all, which `_gather_evidence`
-        # would wave through and the model would be asked to score.
+    # ── Fail closed on evidence, not on a score ───────────────────────────────
+    #
+    # Deliberately NOT a low score. A rejected milestone pays nothing and cannot
+    # be appealed from inside the contract, so "we could not read the code" and
+    # "the code is bad" must not arrive at the same place. This reverts: the
+    # milestone stays `submitted`, and a freelancer who makes the repository
+    # public — or a caller who retries once GitHub is willing — gets a real
+    # verdict.
+    #
+    # Both branches are deterministic and identical on every node: the counts
+    # come from the same tree and the same fetches, and `_compare_user_errors`
+    # matches `[EXTERNAL]` exactly.
+    if accepted == 0:
+        # Checked BEFORE the note is attached, or a repository whose only
+        # readable file was a scaffold README would return the note as its
+        # evidence: a non-empty `code_text` holding no code at all, which
+        # `_gather_evidence` waves through and the model is then asked to score.
+        # Job 16 was rejected at 45 on exactly that — a README scored as code.
         raise gl.vm.UserError(
-            f"{ERROR_EXTERNAL} Could not read any file from {owner}/{name}. "
+            f"{ERROR_EXTERNAL} No source code could be read from {owner}/{name} "
+            f"({len(source_paths)} source files listed, {attempted} attempted). "
             f"Check the repository is public"
             + (f" and that branch `{pinned}` exists." if pinned else ".")
+        )
+
+    if accepted * 100 < attempted * MIN_EVIDENCE_PCT:
+        raise gl.vm.UserError(
+            f"{ERROR_EXTERNAL} Insufficient evidence from {owner}/{name}: only "
+            f"{accepted} of {attempted} source files could be read. The "
+            f"milestone was NOT scored — this is not a judgement on the work. "
+            f"Check the files are present and readable, then verify again."
         )
 
     text = "\n\n".join(pieces)[:budget]
@@ -2564,6 +2605,7 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
         ),
         "kind": kind,
         "planned": planned,
+        "attempted": attempted,
         "read": accepted,
     }
 
@@ -2587,6 +2629,7 @@ def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
     inventory = ""
     kind = ""
     planned = 0
+    attempted = 0
     read = 0
     if github_url:
         # The two paths are chosen by the URL alone, never by whether a fetch
@@ -2601,6 +2644,7 @@ def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
             inventory = str(fetched["inventory"])
             kind = str(fetched["kind"])
             planned = int(fetched["planned"])
+            attempted = int(fetched["attempted"])
             read = int(fetched["read"])
         else:
             # Not GitHub — GitLab, Bitbucket, a self-hosted forge. Render the
@@ -2627,6 +2671,7 @@ def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
         "inventory": inventory,
         "kind": kind,
         "planned": planned,
+        "attempted": attempted,
         "read": read,
         "code_len": len(_normalize(code_text)),
         "site_len": len(_normalize(site_text)),

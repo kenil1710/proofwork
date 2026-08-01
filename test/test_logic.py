@@ -888,6 +888,55 @@ check("non-github short-circuits",
 check("and claims no inventory",
       pw._fetch_github_code("https://gitlab.com/a/b")["kind"], "")
 
+print("\n_fetch_github_code — insufficient evidence is not a low score")
+# Four candidates, one readable. A 25% read must NOT arrive at the model as a
+# repository containing one file: a low score REJECTS the milestone and pays
+# nothing, permanently, and doing that because GitHub would not serve the files
+# punishes the freelancer for a fact about GitHub. Reverting costs a retry.
+ev, _ = _run_counting([
+    ("api.github.com", _Resp(200, _tree(
+        ("src/a.ts", 400), ("src/b.ts", 400), ("src/c.ts", 400), ("src/d.ts", 400)))),
+    ("src/a.ts", _Resp(200, TS_SRC)),
+], url="https://github.com/acme/half")
+check("under half read raises", _text(ev).startswith("RAISED:[EXTERNAL]"), True)
+check("and says it is not a judgement",
+      "not a judgement on the work" in _text(ev), True)
+check("and reports the actual ratio", "1 of 4 source files" in _text(ev), True)
+
+# Exactly half is enough — the threshold is "at least", not "more than".
+ev, _ = _run_counting([
+    ("api.github.com", _Resp(200, _tree(("src/a.ts", 400), ("src/b.ts", 400)))),
+    ("src/a.ts", _Resp(200, TS_SRC)),
+], url="https://github.com/acme/exact")
+check("exactly half is enough", "// FILE: src/a.ts" in _text(ev), True)
+
+# A README and no readable source is the job-16 shape: `pieces` is non-empty, so
+# the old `not pieces` gate let prose through as code_text and the model was
+# asked to score code_quality on a paragraph of documentation.
+ev, _ = _run_counting([
+    ("api.github.com", _Resp(200, _tree(("README.md", 100), ("src/a.ts", 400)))),
+    ("/HEAD/README.md", _Resp(200, b"# Shop\nA storefront.")),
+], url="https://github.com/acme/prose")
+check("a README alone is never scored as code",
+      _text(ev).startswith("RAISED:[EXTERNAL]"), True)
+check("and says no SOURCE was read", "No source code could be read" in _text(ev), True)
+
+# THE FALSE POSITIVE THIS MUST NOT HAVE. Big files exhaust the budget long
+# before the slot count, so `read` is far below the plan's `files` — and that is
+# the budget working exactly as designed, on the repositories that gave us the
+# most to read. Measured against files ATTEMPTED, it is 100%.
+HUGE = b"const x = 1;\n" * 3000                      # ~39000 chars, over any plan
+ev, _ = _run_counting([
+    ("api.github.com", _Resp(200, _tree(*[(f"src/big{i}.ts", 39000) for i in range(9)]))),
+    ("src/big", _Resp(200, HUGE)),
+], url="https://github.com/acme/chunky")
+check("budget exhaustion is not insufficiency",
+      _text(ev).startswith("RAISED:"), False)
+check("the files that fit were read", "// FILE: src/big0.ts" in _text(ev), True)
+check("fewer slots filled than the plan allows",
+      ev["read"] < pw._plan_for(9)["files"], True)
+check("but every attempt succeeded", ev["read"], ev["attempted"])
+
 print("\n_kind_guidance — a Solidity contract is not well-written like a React screen")
 for _kind in ("contracts", "ml", "mobile", "fullstack", "frontend", "backend", "general"):
     # A missing entry would silently drop the type-aware half of the prompt
