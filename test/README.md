@@ -120,6 +120,67 @@ the transfer was *emitted* (it used to revert with a VmError), and test 15
 proves the GEN actually arrives. Expect test 15 to take up to a couple of
 hours.
 
+## Three project types, end to end
+
+```bash
+node project-types-e2e.mjs                 # all three
+node project-types-e2e.mjs --only=solidity # one
+node project-types-e2e.mjs --no-verify     # set up, score nothing
+```
+
+Creates, accepts, submits and verifies one job per project type against real
+public repositories — a Solidity AMM (`Uniswap/v2-core`), a Next.js storefront
+(`vercel/commerce`) and a PyTorch training pipeline (`karpathy/nanoGPT`). This
+is the test of the claim that the evidence gathering adapts to whatever anyone
+submits: three sizes, three languages, three sets of review criteria, one
+contract.
+
+Each submission is repository-only, so the weights are code 50 / completeness
+50 and the verdict is entirely about the code. `[TRANSIENT]` is retried up to
+four times — it means GitHub rate-limited a validator, not that the work is bad.
+
+To see what the reviewer will be handed WITHOUT spending a transaction, run
+`evidence-probe.py` against the same repository first. It reports the size plan
+chosen, the project kind, the inventory paragraph and the exact file list.
+
+## Auditing a payment after the fact
+
+```bash
+node payment-audit.mjs                        # job 0, milestone 0
+node payment-audit.mjs --job=2 --milestone=1
+```
+
+Read-only, sends nothing, and re-runnable. It reconciles a milestone payout
+against the contract's own rules: score band → expected payout, freelancer
+credited exactly that, contract balance down by exactly that, `paid_out`
+matching the GEN that actually moved, milestone `verified`, job `completed`,
+reputation recorded — and that the transfer descends from `verify_milestone`
+rather than a refund path.
+
+It reads transfers, not balance deltas, because **Studio's `eth_getBalance`
+ignores the block tag** — `latest`, `earliest` and an explicit block number all
+return the current balance, so a historical "before" cannot be read back once
+the payout has landed. `sim_getTransactionsForAddress` gives the real record:
+every transfer with its `value`, a `value_credited` flag, `triggered_by`, and
+`triggered_transactions` linking a call to the transfers it emitted. A "before"
+is then *derived* as current balance minus the credits that landed after it.
+
+Count only transfers whose counterparty is the contract. The `sim_fundAccount`
+mints that seeded the account are credits too, and folding them in makes the
+derived "before" read 0.
+
+**It assumes ONE job on the deploy.** The balance checks compare the
+freelancer's total credits from the contract against a single milestone's
+expected payout, so on a deploy carrying several settled jobs it reports four
+false failures — the credit delta, the contract-balance delta, `paid_out` vs
+transferred, and `avg_score`. All four are the tool summing across jobs, not a
+payment defect. On a multi-job deploy, read the per-transfer list out of
+`sim_getTransactionsForAddress` directly instead.
+
+Also expect TWO transfers per verified milestone whenever the score lands below
+90: the freelancer's band payout and the escrow remainder going back to the
+client. A 77 pays 70% and refunds 30%; only a 90+ settles in one transfer.
+
 ## Three Bradbury behaviours the harness works around
 
 These are Bradbury-specific. On Studionet transactions settle on their own, so
