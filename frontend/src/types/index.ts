@@ -94,6 +94,19 @@ export interface Milestone {
   site_url: string;
   mockup_url: string;
   scores: MilestoneScores;
+  /**
+   * The reviewer's own account of what it read, with `file.ext:LINE` citations
+   * into the evidence it was shown.
+   *
+   * This is the leader validator's CLAIM, not a verified fact. Validators
+   * confirm the leader scored evidence they can themselves fetch; they do not
+   * re-derive this prose, and nothing about it gates a payout. Its value is
+   * that it is falsifiable — the cited lines can be opened and checked.
+   *
+   * Empty on milestones verified before the contract began recording it, and
+   * on any reply where the model omitted it.
+   */
+  reasoning?: string;
 }
 
 /** The contract treats both "" and "none" as "no evidence supplied". */

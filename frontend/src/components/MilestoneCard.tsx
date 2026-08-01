@@ -270,6 +270,28 @@ export function MilestoneCard({
         </div>
       ) : null}
 
+      {scored && milestone.reasoning ? (
+        <details className="mt-5 border-t border-surface-800 pt-5">
+          <summary className="cursor-pointer text-sm font-medium text-surface-200">
+            Reviewer&rsquo;s reasoning
+          </summary>
+          <p className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-surface-300">
+            {milestone.reasoning}
+          </p>
+          {/*
+            Stated plainly rather than presented as proof. The citations are
+            checkable — that is the point of recording them — but they are the
+            reviewing validator's account, and other validators confirm only
+            that it scored evidence they can fetch too, never this prose.
+          */}
+          <p className="mt-3 text-xs text-surface-500">
+            Written by the reviewing validator, quoting the files and line
+            numbers it was shown. Open the repository above to check any
+            citation.
+          </p>
+        </details>
+      ) : null}
+
       {milestone.status === "verified" ? (
         <PayoutNotice
           amountBaseUnits={payout}
