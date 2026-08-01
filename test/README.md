@@ -142,6 +142,24 @@ four times — it means GitHub rate-limited a validator, not that the work is ba
 To see what the reviewer will be handed WITHOUT spending a transaction, run
 `evidence-probe.py` against the same repository first. It reports the size plan
 chosen, the project kind, the inventory paragraph and the exact file list.
+Pass `--depth deep` to see the same repository at the deeper reading plan.
+
+## Quick review versus deep review
+
+```bash
+node depth-ab.mjs                 # both depths on vercel/commerce
+node depth-ab.mjs --repo=uniswap  # a small Solidity repo instead
+node depth-ab.mjs --only=deep     # one side
+```
+
+Two jobs identical but for `review_depth`, on the same repository, with the
+same requirements — so any difference in the verdicts is attributable to the
+depth. It asserts the round-trip first (`get_job` must report the depth that
+was created) and fails loudly if it does not, because a silently ignored depth
+would make the two runs one run and every number below it meaningless.
+
+The comparison at the end reports evidence size, the files each review cited,
+the score deltas and how much longer deep took to settle.
 
 ## Auditing a payment after the fact
 

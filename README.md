@@ -137,7 +137,7 @@ npm run dev
 
 | Method | Caller | Description |
 |---|---|---|
-| `create_job` | Client | Create job with milestones, deposit GEN |
+| `create_job` | Client | Create job with milestones, deposit GEN, pick review depth |
 | `accept_job` | Freelancer | Accept an open job |
 | `submit_milestone` | Freelancer | Submit GitHub, site, mockup URLs |
 | `verify_milestone` | Anyone | Trigger AI verification |

@@ -155,6 +155,8 @@ def main():
     parser.add_argument("--mockup", default="none")
     parser.add_argument("--requirements", default="(not supplied)")
     parser.add_argument("--milestone-desc", default="(not supplied)")
+    parser.add_argument("--depth", default="quick", choices=["quick", "deep"],
+                        help="review depth, as the job stores it")
     args = parser.parse_args()
 
     fields = {
@@ -167,6 +169,7 @@ def main():
     if args.input:
         fields.update(json.loads(pathlib.Path(args.input).read_text()))
 
+    depth = pw._normalize_depth(fields.get("review_depth", args.depth))
     github_url = str(fields["github_url"])
     site_url = str(fields["site_url"])
     mockup_url = str(fields["mockup_url"])
@@ -192,6 +195,8 @@ def main():
     print(f"  site    {site_url!r}  usable={has_site}")
     print(f"  mockup  {mockup_url!r}  usable={has_mockup}")
     print(f"  weights {weights}")
+    print(f"  depth   {depth}  (ceiling {pw._text_ceiling(depth)} chars, "
+          f"reasoning cap {pw._reasoning_cap(depth)})")
     print(f"  repo    {pw._parse_github_repo(github_url) or '(not a GitHub URL)'}")
 
     # ── the code half, on its own, so its failure mode is unambiguous ──
@@ -210,7 +215,7 @@ def main():
     fetched = {}
     if has_code and pw._parse_github_repo(github_url):
         try:
-            fetched = pw._fetch_github_code(github_url, focus)
+            fetched = pw._fetch_github_code(github_url, focus, depth)
             code_text = str(fetched["text"])
         except UserError as error:
             print(f"  RAISED  {error.message}")
@@ -229,7 +234,7 @@ def main():
         print(f"\n  kind    {fetched['kind']}")
         print(f"  slots   {fetched['read']} filled of {fetched['planned']} planned")
         print(f"  invent  {fetched['inventory']}")
-    print(f"\n  chars   {len(code_text)} of budget {pw.CODE_TEXT_CHARS}")
+    print(f"\n  chars   {len(code_text)} of budget {pw._text_ceiling(depth)}")
     print(f"  files   {files if files else '(none)'}")
     if code_text:
         print("\n  ── code_text as the prompt receives it ──")
@@ -241,7 +246,7 @@ def main():
     rule("_gather_evidence")
     try:
         evidence = pw._gather_evidence(github_url if has_code else "",
-                                       site_url if has_site else "", focus)
+                                       site_url if has_site else "", focus, depth)
     except UserError as error:
         print(f"  RAISED  {error.message}")
         return 1
@@ -269,6 +274,7 @@ def main():
         bool(has_site and has_mockup and int(weights["design"]) > 0),
         str(evidence["inventory"]),
         str(evidence["kind"]),
+        depth,
     )
     print(prompt)
     rule(f"END OF PROMPT — {len(prompt)} chars")

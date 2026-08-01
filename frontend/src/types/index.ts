@@ -20,6 +20,67 @@ export type JobStatus =
 
 export type MilestoneStatus = "pending" | "submitted" | "verified" | "rejected";
 
+/**
+ * How much of the repository verification reads, chosen by the client when the
+ * job is created and fixed for its life.
+ *
+ * A property of the job rather than of the verify call because every validator
+ * has to derive the same reading plan from state alone — see `review_depth` on
+ * the contract's `Job`.
+ */
+export type ReviewDepth = "quick" | "deep";
+
+export interface ReviewDepthInfo {
+  value: ReviewDepth;
+  label: string;
+  /** One line for a badge or a radio label. */
+  summary: string;
+  /** The fuller explanation, for the form and the docs. */
+  detail: string;
+  /**
+   * How long verification takes, measured on Studionet against
+   * vercel/commerce — two runs per depth. Not a guess: the first version of
+   * this field claimed deep took "two to three times" as long, and the
+   * measurement said otherwise.
+   */
+  estimate: string;
+  /** What the reviewer is actually handed, in round numbers. */
+  reads: string;
+}
+
+/**
+ * The two depths, described once.
+ *
+ * Shared by the create form, the job header, the milestone card and the docs so
+ * the numbers cannot drift between the place a client chooses a depth and the
+ * place they see what it bought.
+ */
+export const REVIEW_DEPTHS: Record<ReviewDepth, ReviewDepthInfo> = {
+  quick: {
+    value: "quick",
+    label: "Quick review",
+    summary: "Fast verification for typical projects.",
+    detail:
+      "Reads around 15 files, each in an excerpt. Good for small and medium work where the milestone turns on a handful of files.",
+    estimate: "about 30-60 seconds (measured 27s and 55s)",
+    reads: "~15 files, up to 36k characters",
+  },
+  deep: {
+    value: "deep",
+    label: "Deep review",
+    summary: "Thorough analysis for complex projects.",
+    detail:
+      "Reads up to 40 files, most of them whole, and asks the reviewer to account for each one and for how they fit together. Better for high-value work — DeFi protocols, large dApps — where the milestone turns on cross-file behaviour.",
+    estimate: "no slower here in testing (25s and 26s)",
+    reads: "up to 40 files, up to 200k characters",
+  },
+};
+
+/** Anything unrecognised is quick, exactly as the contract normalises it. */
+export function toReviewDepth(value: string | undefined): ReviewDepth {
+  return String(value ?? "").trim().toLowerCase() === "deep" ? "deep" : "quick";
+}
+
 /** Returned by `get_job(job_id)`. */
 export interface Job {
   client: string;
@@ -57,6 +118,13 @@ export interface Job {
   accepted_at: number;
   /** Milestone payments already released, in base units. */
   paid_out: bigint;
+  /**
+   * How thoroughly each milestone of this job is verified.
+   *
+   * Set once at creation. Jobs created before this field existed read as
+   * `"quick"` — `getJob` normalises, as the contract does.
+   */
+  review_depth: ReviewDepth;
   /**
    * The chain's own clock at read time, epoch seconds.
    *

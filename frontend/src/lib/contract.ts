@@ -36,8 +36,8 @@ import {
   getWalletClient,
 } from "./genlayer";
 import { describeContractError, stripErrorClass } from "./contract-errors";
-import { MAX_STAKE_PCT, SECONDS_PER_DAY } from "@/types";
-import type { Job, Milestone, Reputation } from "@/types";
+import { MAX_STAKE_PCT, SECONDS_PER_DAY, toReviewDepth } from "@/types";
+import type { Job, Milestone, Reputation, ReviewDepth } from "@/types";
 
 export type { TransactionHash };
 
@@ -151,12 +151,17 @@ export async function getJob(jobId: number): Promise<Job> {
 
     type RawJob = Omit<
       Job,
-      "total_amount" | "required_stake" | "freelancer_stake" | "paid_out"
+      | "total_amount"
+      | "required_stake"
+      | "freelancer_stake"
+      | "paid_out"
+      | "review_depth"
     > & {
       total_amount: string;
       required_stake: string;
       freelancer_stake: string;
       paid_out: string;
+      review_depth?: string;
     };
     const parsed = JSON.parse(quoted) as RawJob;
 
@@ -166,6 +171,9 @@ export async function getJob(jobId: number): Promise<Job> {
       required_stake: BigInt(parsed.required_stake),
       freelancer_stake: BigInt(parsed.freelancer_stake),
       paid_out: BigInt(parsed.paid_out),
+      // Normalised rather than cast: a job created before the field existed
+      // omits it, and the UI must not render `undefined` as a review depth.
+      review_depth: toReviewDepth(parsed.review_depth),
     };
   } catch (error) {
     throw new ContractReadError(
@@ -699,6 +707,11 @@ export interface CreateJobParams {
   deadlineDays: number;
   /** Share of escrow a freelancer must stake to accept, 0–50. */
   stakePercentage: number;
+  /**
+   * How thoroughly milestones are verified. Fixed for the job's life, so this
+   * is the client's only chance to choose it.
+   */
+  reviewDepth: ReviewDepth;
 }
 
 /**
@@ -724,6 +737,7 @@ export async function createJob(
     depositBaseUnits,
     deadlineDays,
     stakePercentage,
+    reviewDepth,
   } = params;
 
   if (milestoneDescriptions.length !== milestonePercentages.length) {
@@ -774,6 +788,10 @@ export async function createJob(
       milestonePercentages.join(MILESTONE_SEPARATOR),
       deadlineDays * SECONDS_PER_DAY,
       stakePercentage,
+      // Normalised here too. The contract degrades an unrecognised value to
+      // "quick" rather than reverting — a reverting create keeps the deposit —
+      // so a typo would silently downgrade the job instead of failing loudly.
+      toReviewDepth(reviewDepth),
     ] as never,
     value: depositBaseUnits,
   });

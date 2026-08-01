@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { useContractWrite } from "@/hooks/useContractWrite";
 import { useWallet } from "@/components/WalletProvider";
-import { JobStatusBadge } from "@/components/StatusBadge";
+import { JobStatusBadge, ReviewDepthBadge } from "@/components/StatusBadge";
 import { MilestoneCard } from "@/components/MilestoneCard";
 import { PayoutNotice } from "@/components/PayoutNotice";
 import { Breadcrumbs } from "@/components/Breadcrumbs";
@@ -248,7 +248,13 @@ export function JobDetail({ jobId }: { jobId: number }) {
           </p>
           <h1 className="title-display mt-2 text-surface-100">{job.title}</h1>
         </div>
-        <JobStatusBadge status={job.status} />
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Shown beside the status because it changes what a verdict on this
+              job MEANS: the same score from a quick and a deep review rests on
+              a different amount of reading. */}
+          <ReviewDepthBadge depth={job.review_depth} />
+          <JobStatusBadge status={job.status} />
+        </div>
       </div>
 
       <dl className="mt-8 grid gap-6 panel p-6 sm:grid-cols-2 lg:grid-cols-4">

@@ -54,6 +54,15 @@ class Job:
     paid_out: u64
     """Cumulative milestone payments already sent to the freelancer. Needed so
     an abandonment refunds only what is genuinely left in escrow."""
+    review_depth: str
+    """How much of the repository verification reads: "quick" or "deep".
+
+    Chosen by the client at creation and fixed for the job's life. It has to be
+    a property of the JOB rather than of the verify call, because every node
+    must reach the same reading plan from state alone: a depth passed in by
+    whoever triggers verification would let the leader read 40 files while a
+    validator read 15, and the evidence fingerprints would diverge on an honest
+    leader. See `_plan_for`."""
 
 
 MAX_STAKE_PCT = 50
@@ -180,6 +189,12 @@ ERROR_LLM = "[LLM_ERROR]"  # model misbehaved — never agreement, force rotatio
 # The four scoring axes, in the order they are weighted and stored.
 SCORE_KEYS = ("code", "design", "functionality", "completeness")
 
+# Review depth, chosen per job by the client. Declared up here rather than
+# beside the plans they select because they are default argument values on
+# functions defined above those plans, and a default is evaluated at def time.
+DEPTH_QUICK = "quick"
+DEPTH_DEEP = "deep"
+
 REASONING_ALIASES = ("reasoning", "reason", "analysis", "rationale", "explanation")
 """What the model might call its written justification.
 
@@ -194,6 +209,23 @@ It goes into contract storage on every verified milestone, so it is bounded
 rather than trusted. Whitespace is collapsed before the cut so the cap measures
 content and not a model's indentation habits. Enough for a line-cited paragraph
 per axis; short of an essay."""
+
+DEEP_REASONING_CHARS = 6000
+"""The same cap for a deep review.
+
+A deep prompt asks for a line per source file on top of the per-axis paragraphs,
+so 40 files do not fit in 1500 characters — the cap would truncate exactly the
+per-file detail the client opted in for, mid-sentence and without saying so.
+Still bounded, because it is still untrusted text entering storage."""
+
+
+def _reasoning_cap(depth: str) -> int:
+    """How much stored justification this review depth is allowed."""
+    return (
+        DEEP_REASONING_CHARS
+        if _normalize_depth(depth) == DEPTH_DEEP
+        else REASONING_CHARS
+    )
 
 # What the model is asked to call each axis, mapped to our internal key.
 SCORE_ALIASES = {
@@ -259,7 +291,9 @@ def _find_json(text: str) -> object:
     return candidate if isinstance(candidate, dict) else None
 
 
-def _extract_scores(reply: object, weights: dict) -> dict:
+def _extract_scores(
+    reply: object, weights: dict, reasoning_chars: int = REASONING_CHARS
+) -> dict:
     """
     Pull all four scores out of whatever the model actually returned.
 
@@ -338,7 +372,7 @@ def _extract_scores(reply: object, weights: dict) -> dict:
         if alias in parsed:
             reasoning = str(parsed[alias])
             break
-    scores["reasoning"] = " ".join(reasoning.split())[:REASONING_CHARS]
+    scores["reasoning"] = " ".join(reasoning.split())[:reasoning_chars]
 
     return scores
 
@@ -360,6 +394,7 @@ def _evidence_prompt(
     has_shots: bool,
     inventory: str = "",
     kind: str = "",
+    depth: str = DEPTH_QUICK,
 ) -> str:
     """
     One prompt covering all four criteria, aimed at the kind of project it is.
@@ -452,6 +487,36 @@ def _evidence_prompt(
     else:
         criteria_section = ""
 
+    # Deep review asks for a different SHAPE of answer, not merely a longer one.
+    # The extra files only pay for themselves if the reviewer is made to account
+    # for them individually — otherwise a 40-file excerpt gets the same three
+    # sentences a 12-file one did, and the client paid for reading that never
+    # surfaced. Per-file lines are also the cheapest way to catch a reviewer
+    # skimming: a file it never mentions is visible in the output.
+    if _normalize_depth(depth) == DEPTH_DEEP and code_text:
+        depth_section = (
+            "DEPTH: this client selected DEEP REVIEW, so more of the repository "
+            "is shown above than usual and the review is expected to match.\n"
+            "- Walk the evidence file by file before you score. In `reasoning`, "
+            "give one line per source file shown, in the form "
+            "`path/to/file.ext — <what it does> — <sound / concern / gap>`. Cover "
+            "every file shown, including the ones that turn out to be routine; "
+            "an omitted file reads as an unread one.\n"
+            "- Then, for each requirement, cite EVERY place it is implemented "
+            "rather than the first one you find, and say how those places fit "
+            "together. Cross-file behaviour — a guard in one file relied on by "
+            "another, state written in one place and read in a second — is what "
+            "this depth exists to catch and a single-file citation cannot show.\n"
+            "- Name the specific risks you can point at: unchecked arithmetic, "
+            "missing access control, an unhandled failure path, a race. Cite the "
+            "line. Do not pad the review with generic advice that would apply to "
+            "any project.\n"
+            "- Your scores must still follow the same calibration below. Depth "
+            "buys a better-evidenced verdict, NOT a harsher or a kinder one."
+        )
+    else:
+        depth_section = ""
+
     return f"""You are reviewing a freelance deliverable against its milestone.
 Your scores release or withhold real money, so judge the work in front of you on
 its merits — neither generously nor defensively.
@@ -465,6 +530,8 @@ THIS MILESTONE:
 {inventory_section}
 
 {criteria_section}
+
+{depth_section}
 
 {code_section}
 
@@ -988,25 +1055,64 @@ rejected after the fact as generated output. It is separate from the slot count
 because a rejected bundle costs a request and fills nothing."""
 
 
-def _plan_for(source_count: int) -> dict:
-    """The reading plan for a repository of this size.
+PLAN_DEEP_SMALL = {"files": 20, "budget": 100000, "per_file": 20000, "fetches": 28}
+PLAN_DEEP_MEDIUM = {"files": 25, "budget": 150000, "per_file": 15000, "fetches": 34}
+PLAN_DEEP_LARGE = {"files": 40, "budget": 200000, "per_file": 10000, "fetches": 52}
+"""Deep review: the same three shapes, opened up roughly fivefold.
+
+Deep is opt-in per job because it is not free — more files means more raw
+fetches on the leader AND on every validator, a prompt several times longer,
+and a verification that takes correspondingly longer to settle. For a
+five-file script that buys nothing; for a DeFi protocol where the milestone
+turns on how three contracts interact, quick mode's 2600-character slices show
+the reviewer function signatures and not the bodies.
+
+The shapes keep the depth-versus-breadth trade of their quick counterparts:
+small reads everything whole (20 files at 20000 characters is most repositories
+of that size in their entirety), large still favours breadth (40 files at
+10000) — but 10000 characters is a whole contract where 2600 was its imports.
+
+`fetches` allows slack above `files` for the context pass and for bundles
+rejected after download; the budget still binds before the slot count on any
+repository with substantial files."""
+
+
+def _normalize_depth(value: str) -> str:
+    """Anything that is not recognisably "deep" is quick.
+
+    Deliberately lenient rather than raising: this is reached from `create_job`,
+    and **a create that reverts keeps the deposit** with no job record to refund
+    it from. Downgrading an unrecognised value to the cheaper mode costs the
+    client some thoroughness; rejecting it costs them their escrow.
+    """
+    return DEPTH_DEEP if str(value).strip().lower() == DEPTH_DEEP else DEPTH_QUICK
+
+
+def _plan_for(source_count: int, depth: str = DEPTH_QUICK) -> dict:
+    """The reading plan for a repository of this size, at this review depth.
 
     Returned as a fresh plain dict rather than one of the module constants:
     the result crosses into a nondet closure and gets cloudpickled, and a
     caller mutating a shared constant would change the plan for every later
     evaluation in the same process.
+
+    `depth` comes from the job's stored `review_depth`, so the leader and every
+    validator derive the identical plan — the plan decides which files are read,
+    and two nodes on different plans fingerprint different evidence.
     """
+    deep = _normalize_depth(depth) == DEPTH_DEEP
     if source_count <= SIZE_SMALL_MAX:
-        chosen = PLAN_SMALL
+        chosen = PLAN_DEEP_SMALL if deep else PLAN_SMALL
         label = "small"
     elif source_count <= SIZE_MEDIUM_MAX:
-        chosen = PLAN_MEDIUM
+        chosen = PLAN_DEEP_MEDIUM if deep else PLAN_MEDIUM
         label = "medium"
     else:
-        chosen = PLAN_LARGE
+        chosen = PLAN_DEEP_LARGE if deep else PLAN_LARGE
         label = "large"
     return {
         "size": label,
+        "depth": DEPTH_DEEP if deep else DEPTH_QUICK,
         "files": int(chosen["files"]),
         "budget": int(chosen["budget"]),
         "per_file": int(chosen["per_file"]),
@@ -1090,6 +1196,19 @@ used directly only when the code URL is a forge this contract cannot list
 read; then 8000, which was still under a tenth of a real deliverable. Measured on
 `cronpay-code/cronpay`: 8000 characters bought 4.7% of four files and 0% of the
 277KB of Solidity the milestone was actually about."""
+
+DEEP_TEXT_CHARS = 200000
+"""The same ceiling for a deep review — the largest deep plan's budget.
+
+This constant is why the ceiling is applied through `_text_ceiling` rather than
+directly: clamping a deep plan against `CODE_TEXT_CHARS` would silently hand
+back quick mode's 36000 characters on a job the client paid attention for, and
+the only symptom would be a deep review that read no more than a quick one."""
+
+
+def _text_ceiling(depth: str) -> int:
+    """Hard cap on evidence characters at this depth."""
+    return DEEP_TEXT_CHARS if _normalize_depth(depth) == DEPTH_DEEP else CODE_TEXT_CHARS
 
 LINE_NUMBER_WIDTH = 4
 """Column width for the line numbers prefixed to every evidence line.
@@ -2280,7 +2399,7 @@ def _list_repo_tree(owner: str, name: str, ref: str, pinned: str = "") -> list:
     return parsed["tree"][:MAX_TREE_ENTRIES]
 
 
-def _fetch_github_code(github_url: str, focus: str = "") -> dict:
+def _fetch_github_code(github_url: str, focus: str = "", depth: str = DEPTH_QUICK) -> dict:
     """
     Real source out of a GitHub repository, in the quantity that repository
     warrants.
@@ -2408,7 +2527,7 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
             + (f" under `{subpath}`." if subpath else ".")
         )
 
-    plan = _plan_for(len(source_paths))
+    plan = _plan_for(len(source_paths), depth)
     languages = _detect_languages(source_paths)
     # Frameworks are read from the WHOLE tree rather than the linked
     # subdirectory: a `/tree/main/contracts` submission is still built by the
@@ -2420,8 +2539,9 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
     per_file = int(plan["per_file"])
     fetch_cap = int(plan["fetches"])
     budget = int(plan["budget"])
-    if budget > CODE_TEXT_CHARS:
-        budget = CODE_TEXT_CHARS
+    ceiling = _text_ceiling(depth)
+    if budget > ceiling:
+        budget = ceiling
 
     pieces = []
     used = 0
@@ -2617,7 +2737,9 @@ def _fetch_github_code(github_url: str, focus: str = "") -> dict:
     }
 
 
-def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
+def _gather_evidence(
+    github_url: str, site_url: str, focus: str = "", depth: str = DEPTH_QUICK
+) -> dict:
     """
     Fetch the text evidence. No LLM — this is the half a validator can afford.
 
@@ -2630,6 +2752,10 @@ def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
     focus strings would select different files, fingerprint different content,
     and the validator would read an honest leader as a liar. Both call sites
     therefore pass the same value, built the same way — see `verify_milestone`.
+
+    `depth` is the same kind of parameter and carries the same obligation: it
+    selects the reading plan, so it must come from the job's stored
+    `review_depth` on every node and never from the caller of `verify_milestone`.
     """
     code_text = ""
     site_text = ""
@@ -2646,7 +2772,7 @@ def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
         # the API, and the resulting fingerprint mismatch would look like a
         # lying leader instead of a busy network.
         if _parse_github_repo(github_url):
-            fetched = _fetch_github_code(github_url, focus)
+            fetched = _fetch_github_code(github_url, focus, depth)
             code_text = str(fetched["text"])
             inventory = str(fetched["inventory"])
             kind = str(fetched["kind"])
@@ -2657,7 +2783,7 @@ def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
             # Not GitHub — GitLab, Bitbucket, a self-hosted forge. Render the
             # page, which is what every side does here, so they still agree.
             code_text = str(gl.nondet.web.render(github_url, mode="text"))[
-                :CODE_TEXT_CHARS
+                : _text_ceiling(depth)
             ]
     if site_url:
         site_text = str(gl.nondet.web.render(site_url, mode="text"))[:2000]
@@ -2698,6 +2824,7 @@ def _gather_and_score(
     requirements: str,
     milestone_desc: str,
     weights: dict,
+    depth: str = DEPTH_QUICK,
 ) -> dict:
     """
     The leader's half: fetch evidence, then score it with ONE LLM call.
@@ -2711,7 +2838,9 @@ def _gather_and_score(
     reach the leader, and anything storage-backed kills the block before it
     runs.
     """
-    ev = _gather_evidence(github_url, site_url, _evidence_focus(milestone_desc, requirements))
+    ev = _gather_evidence(
+        github_url, site_url, _evidence_focus(milestone_desc, requirements), depth
+    )
 
     # Screenshots are the most expensive fetch, so take them only when there is
     # actually a mockup to compare against.
@@ -2731,6 +2860,7 @@ def _gather_and_score(
         bool(shots),
         str(ev["inventory"]),
         str(ev["kind"]),
+        depth,
     )
 
     if shots:
@@ -2738,7 +2868,7 @@ def _gather_and_score(
     else:
         reply = gl.nondet.exec_prompt(prompt, response_format="json")
 
-    scores = _extract_scores(reply, weights)
+    scores = _extract_scores(reply, weights, _reasoning_cap(depth))
 
     # Carry the evidence fingerprint out with the scores. Not the page text —
     # that would bloat the value that goes through consensus and gets stored.
@@ -2852,6 +2982,7 @@ class ProofWork(gl.Contract):
         milestone_percentages: str,
         deadline_seconds: u64,
         stake_percentage: u32,
+        review_depth: str = DEPTH_QUICK,
     ) -> u32:
         amount = gl.message.value
         if amount == 0:
@@ -2905,6 +3036,10 @@ class ProofWork(gl.Contract):
             freelancer_stake=u64(0),
             accepted_at=u64(0),
             paid_out=u64(0),
+            # Normalised, not validated: an unrecognised value becomes "quick"
+            # rather than reverting, because a reverting create keeps the
+            # deposit with no job record left to refund it from.
+            review_depth=_normalize_depth(review_depth),
         )
 
         for i in range(len(descs)):
@@ -3042,6 +3177,11 @@ class ProofWork(gl.Contract):
         # `str` field captured raw is fine, so it is specifically the
         # copy_to_memory'd dataclass attributes that need converting.
         requirements = str(job_mem.requirements)
+        # Read from the JOB, never from the caller: `verify_milestone` is
+        # permissionless, and a depth supplied by whoever pressed the button
+        # would let the leader and a validator read different amounts of the
+        # same repository — an honest leader failing its own evidence check.
+        depth = _normalize_depth(str(job_mem.review_depth))
         milestone_desc = str(ms_mem.description)
         github_url = str(ms_mem.github_url)
         site_url = str(ms_mem.site_url)
@@ -3106,7 +3246,13 @@ class ProofWork(gl.Contract):
         # affirming the leader's exact number.
         def leader_fn() -> dict:
             return _gather_and_score(
-                code_url, live_url, design_url, requirements, milestone_desc, weights
+                code_url,
+                live_url,
+                design_url,
+                requirements,
+                milestone_desc,
+                weights,
+                depth,
             )
 
         def validator_fn(leader_result: gl.vm.Result) -> bool:
@@ -3125,7 +3271,7 @@ class ProofWork(gl.Contract):
                 # here without costing an LLM call.
                 #
                 # If we succeed where the leader failed, that IS disagreement.
-                _gather_evidence(code_url, live_url, focus)
+                _gather_evidence(code_url, live_url, focus, depth)
                 return False
 
             leader_scores = leader_result.calldata
@@ -3139,7 +3285,7 @@ class ProofWork(gl.Contract):
 
             # Re-fetch the evidence — NOT the scoring. See the note on
             # EVIDENCE_FINGERPRINT_CHARS for why the LLM call is not repeated.
-            own_evidence = _gather_evidence(code_url, live_url, focus)
+            own_evidence = _gather_evidence(code_url, live_url, focus, depth)
             return _evidence_matches(leader_scores, own_evidence)
 
         scores = gl.vm.run_nondet(
@@ -3172,7 +3318,7 @@ class ProofWork(gl.Contract):
         # by design — see `_extract_scores`. Re-cut the length here rather than
         # trusting the value: the block's output is only as bounded as whatever
         # the leader put in it.
-        ms.reasoning = str(scores.get("reasoning", ""))[:REASONING_CHARS]
+        ms.reasoning = str(scores.get("reasoning", ""))[: _reasoning_cap(depth)]
 
         # ── Determine payment based on score ──
         # Same threshold the validator gates on, deliberately — if these two
@@ -3347,6 +3493,7 @@ class ProofWork(gl.Contract):
                 "freelancer_stake": int(job.freelancer_stake),
                 "accepted_at": int(job.accepted_at),
                 "paid_out": int(job.paid_out),
+                "review_depth": job.review_depth,
                 # The chain's own clock, so a client cannot be told the
                 # deadline has passed by a browser with a skewed system time.
                 "now": _epoch_now(),

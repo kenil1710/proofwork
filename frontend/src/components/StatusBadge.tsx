@@ -1,4 +1,5 @@
-import type { JobStatus, MilestoneStatus } from "@/types";
+import { REVIEW_DEPTHS } from "@/types";
+import type { JobStatus, MilestoneStatus, ReviewDepth } from "@/types";
 
 /**
  * Full class strings, not fragments. Tailwind scans source statically, so a
@@ -57,5 +58,26 @@ export function MilestoneStatusBadge({ status }: { status: MilestoneStatus }) {
   const style = MILESTONE_STYLE[status] ?? MILESTONE_STYLE.pending;
   return (
     <span className={`${BASE} ${style}`}>{MILESTONE_LABEL[status] ?? status}</span>
+  );
+}
+
+/**
+ * Deliberately not colour-coded the way the status badges are.
+ *
+ * A depth is not a state and certainly not a verdict — a deep review is not a
+ * better outcome than a quick one, it is a different amount of reading. Giving
+ * it green or amber would read as one.
+ */
+const DEPTH_STYLE: Record<ReviewDepth, string> = {
+  quick: "border-surface-700 bg-surface-800 text-surface-400",
+  deep: "border-orchid-400/30 bg-orchid-400/10 text-orchid-300",
+};
+
+export function ReviewDepthBadge({ depth }: { depth: ReviewDepth }) {
+  const style = DEPTH_STYLE[depth] ?? DEPTH_STYLE.quick;
+  return (
+    <span className={`${BASE} ${style}`} title={REVIEW_DEPTHS[depth]?.detail}>
+      {REVIEW_DEPTHS[depth]?.label ?? depth}
+    </span>
   );
 }

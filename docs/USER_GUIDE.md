@@ -73,6 +73,42 @@ The 50% cap is deliberate: past roughly half the escrow, a stake stops deterring
 no-shows and becomes a way to take more from a freelancer than the job pays —
 the same scam running the other direction.
 
+### Quick review or deep review
+
+You pick one when you post the job. It sets **how much of the repository the AI
+reviewer is handed** — not how strictly it judges what it sees. Both depths use
+the same scoring bands and the same calibration.
+
+| | Quick review (default) | Deep review |
+|---|---|---|
+| Files read | ~15, ranked by relevance | Up to 40 |
+| How much of each | Excerpts; long files truncated | Most files whole |
+| Evidence budget | Up to 36,000 characters | Up to 200,000 characters |
+| Asked of the reviewer | Per-requirement citations | The same, plus a line per file and how they connect |
+| Verification time | 27s and 55s, measured | 25s and 26s — no slower, despite ~2x the fetching |
+
+Measured on `vercel/commerce` (65 source files): quick fills 10 slots with
+30,000 characters and truncates the three largest files; deep fills 25 with
+80,000 and reads them whole. On a small repository such as `Uniswap/v2-core`
+(11 files) both read every file, and the difference is that quick truncates
+`UniswapV2Pair.sol` at 6,000 of its 9,788 characters while deep reads all of it.
+
+Two A/B pairs on that repository, identical but for the depth: quick scored
+97 then 84, deep scored 97 both times, and deep's write-up ran 3,200-3,500
+characters against quick's 1,400-1,500 — quick hit the 1,500-character cap and
+was truncated mid-sentence. The scores are the same LLM on the same work, so
+treat the spread as model variance rather than as a rule; what the depth
+reliably changed was the evidence, not the number.
+
+Choose deep when the milestone cannot be judged from a few files — a protocol
+where the collateral check is in one contract and the liquidation path in
+another. Choose quick for a landing page.
+
+**The depth is fixed at creation.** Every validator has to derive the same
+reading plan from stored state; if it could change, one node would read 40 files
+while another read 15 and they would disagree about the evidence rather than
+about the work.
+
 ### Abandoning a job
 
 Once the deadline has passed **and at least one milestone is still unverified**,

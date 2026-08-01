@@ -452,6 +452,64 @@ _p = pw._plan_for(5)
 _p["files"] = 999
 check("plan is a fresh dict", pw._plan_for(5)["files"] == 999, False)
 
+print("\n_normalize_depth — an unknown depth costs thoroughness, never the deposit")
+check("quick stays quick", pw._normalize_depth("quick"), "quick")
+check("deep stays deep", pw._normalize_depth("deep"), "deep")
+check("case and padding tolerated", pw._normalize_depth("  Deep "), "deep")
+# Everything else degrades rather than raising: `create_job` is the caller, and
+# a create that reverts keeps the escrow with no job record to refund it from.
+for _bad in ("", "DEEPEST", "thorough", "1", "none", "quick "):
+    check(f"unrecognised {_bad!r} -> quick", pw._normalize_depth(_bad), "quick")
+
+print("\n_plan_for — deep review reads more of the same repository")
+DSMALL, DMEDIUM, DLARGE = (
+    pw._plan_for(5, "deep"), pw._plan_for(50, "deep"), pw._plan_for(400, "deep"),
+)
+check("deep is reported in the plan", DSMALL["depth"], "deep")
+check("quick is reported too", SMALL["depth"], "quick")
+check("size classification is unchanged by depth", DLARGE["size"], "large")
+for _quick, _deep in ((SMALL, DSMALL), (MEDIUM, DMEDIUM), (LARGE, DLARGE)):
+    label = _quick["size"]
+    check(f"deep reads more files ({label})", _deep["files"] > _quick["files"], True)
+    check(f"deep reads them deeper ({label})",
+          _deep["per_file"] > _quick["per_file"], True)
+    check(f"deep gets a bigger budget ({label})",
+          _deep["budget"] > _quick["budget"], True)
+    check(f"deep allows more fetches ({label})",
+          _deep["fetches"] > _quick["fetches"], True)
+    # The same depth-versus-breadth shape as quick mode: the total still binds
+    # before the slot count, so big files fill fewer slots than the ceiling.
+    check(f"total still binds before the file count (deep {label})",
+          _deep["files"] * _deep["per_file"] > _deep["budget"], True)
+
+# The ceiling is depth-aware, and this is the trap it exists for: clamping a
+# deep plan against CODE_TEXT_CHARS would hand back quick mode's 36000
+# characters on a job the client explicitly paid attention for, with a deep
+# badge in the UI and no other symptom.
+check("quick ceiling unchanged", pw._text_ceiling("quick"), pw.CODE_TEXT_CHARS)
+check("deep ceiling is the deep one", pw._text_ceiling("deep"), pw.DEEP_TEXT_CHARS)
+check("deep ceiling clears the largest deep budget",
+      pw.DEEP_TEXT_CHARS >= DLARGE["budget"], True)
+for _plan in (DSMALL, DMEDIUM, DLARGE):
+    check(f"deep plan fits the deep ceiling ({_plan['size']})",
+          _plan["budget"] <= pw.DEEP_TEXT_CHARS, True)
+check("an unknown depth reads the quick plan", pw._plan_for(5, "wat")["files"],
+      SMALL["files"])
+
+# The reasoning cap moves with the depth, or the per-file lines a deep review is
+# asked for get truncated mid-sentence on their way into storage.
+check("quick reasoning cap", pw._reasoning_cap("quick"), pw.REASONING_CHARS)
+check("deep reasoning cap", pw._reasoning_cap("deep"), pw.DEEP_REASONING_CHARS)
+check("deep cap is bigger", pw.DEEP_REASONING_CHARS > pw.REASONING_CHARS, True)
+check("_extract_scores honours the cap it is given",
+      len(pw._extract_scores(
+          '{"reasoning": "' + "x" * 9000 + '", "code_quality": 80, "design_match": 0,'
+          ' "functionality": 0, "completeness": 80}',
+          {"code": 50, "design": 0, "functionality": 0, "completeness": 50},
+          pw.DEEP_REASONING_CHARS,
+      )["reasoning"]),
+      pw.DEEP_REASONING_CHARS)
+
 print("\n_detect_languages — what the repository is written in")
 check("histogram, biggest first",
       pw._detect_languages(["a.py", "b.py", "c.ts"]), [("Python", 2), ("TypeScript", 1)])
@@ -986,6 +1044,31 @@ check("no inventory section when there is no inventory",
 check("no criteria section when the kind is unknown",
       "HOW TO REVIEW THIS KIND" in bare, False)
 check("the rubric is still there", "90-100" in bare, True)
+
+print("\n_evidence_prompt — deep review asks for a different shape of answer")
+deep_prompt = pw._evidence_prompt("// FILE: a.sol\n   1| contract X {}", "",
+                                  "Ship the escrow", "Build an escrow", W, False,
+                                  INV, "contracts", "deep")
+check("quick prompt says nothing about depth", "DEEP REVIEW" in prompt, False)
+check("deep prompt announces itself", "DEEP REVIEW" in deep_prompt, True)
+# The extra files only pay for themselves if the reviewer accounts for them
+# one by one — otherwise 40 files get the three sentences 12 files did.
+check("deep asks for a line per file", "one line per source file" in deep_prompt, True)
+check("deep asks for every occurrence, not the first",
+      "cite EVERY place it is implemented" in deep_prompt, True)
+check("deep asks about cross-file behaviour",
+      "Cross-file behaviour" in deep_prompt, True)
+# Depth must not become severity: the bands decide the money, and a deep review
+# that scored the same work lower would make the option a penalty.
+check("deep keeps the same calibration",
+      "Depth buys a better-evidenced verdict" in deep_prompt, True)
+check("deep still carries the universal bands", "90-100" in deep_prompt, True)
+check("deep still ends with the JSON contract",
+      deep_prompt.rstrip().endswith("}"), True)
+# Nothing to walk file by file when no repository was submitted.
+site_only = pw._evidence_prompt("", "page text", "Ship it", "Build it", W, False,
+                                "", "", "deep")
+check("no depth section without a repository", "DEEP REVIEW" in site_only, False)
 
 print("\nevidence fingerprinting")
 check("whitespace collapsed", pw._normalize("a  b\n\tc "), "a b c")

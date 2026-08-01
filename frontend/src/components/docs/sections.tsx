@@ -176,7 +176,7 @@ export const DOC_SECTIONS: DocSection[] = [
     title: "For clients",
     navLabel: "For clients",
     keywords:
-      "clients post job requirements milestones deposit escrow mockup figma design brief write good requirements percentages cancel refund",
+      "clients post job requirements milestones deposit escrow mockup figma design brief write good requirements percentages cancel refund quick review deep review depth thorough how many files read budget defi protocol",
     body: (
       <>
         <P>
@@ -239,6 +239,57 @@ Contact form, dark mode, deployment     30%`}
           it and design match becomes a scored criterion; leave it out and its
           weight moves to the other three.
         </P>
+
+        <H3>Quick review or deep review</H3>
+        <P>
+          You choose one when you post the job, and it applies to every
+          milestone on it. It sets how much of the repository the AI reviewer is
+          actually handed — which is a different question from how strictly it
+          judges what it sees. Both depths use the same scoring bands and the
+          same calibration; a deep review is not a harsher grader, it is a
+          better-read one.
+        </P>
+        <DocTable
+          head={["", "Quick review — default", "Deep review"]}
+          rows={[
+            ["Files read", "Around 15, ranked by relevance", "Up to 40"],
+            [
+              "How much of each",
+              "Excerpts — long files are truncated",
+              "Most files whole",
+            ],
+            ["Evidence budget", "Up to 36,000 characters", "Up to 200,000 characters"],
+            [
+              "What the reviewer is asked for",
+              "Per-requirement citations",
+              "The same, plus a line accounting for every file and how they connect",
+            ],
+            [
+              "Verification time",
+              "27s and 55s, measured",
+              "25s and 26s — no slower here, though it fetches roughly twice as much",
+            ],
+            [
+              "Worth it for",
+              "Small and medium work turning on a handful of files",
+              "High-value work — DeFi protocols, large dApps — where behaviour spans files",
+            ],
+          ]}
+        />
+        <P>
+          The honest test is whether the milestone can be judged from a few
+          files. A landing page can; a lending protocol where the collateral
+          check lives in one contract and the liquidation path in another cannot
+          — a quick review sees each file&rsquo;s first few thousand characters
+          and cannot follow the call between them.
+        </P>
+        <Callout tone="warn">
+          The depth is fixed at creation and cannot be changed later, not even
+          by re-running verification. Every validator has to derive the same
+          reading plan from the job&rsquo;s stored state — if the depth could
+          move, one node would read 40 files while another read 15, and they
+          would disagree about evidence rather than about the work.
+        </Callout>
 
         <H3>Cancelling</H3>
         <P>
@@ -304,6 +355,30 @@ Contact form, dark mode, deployment     30%`}
             [
               "Host uses bot protection",
               "Screenshots get blocked. Vercel, Netlify and GitHub Pages are safe; some hosts front everything with a challenge page",
+            ],
+          ]}
+        />
+
+        <H3>How much of your repository gets read</H3>
+        <P>
+          The client chose a review depth when they posted the job, and it is
+          shown on the job page. It decides how much of the repository the
+          reviewer is handed — which is worth knowing before you submit, because
+          it is what separates &ldquo;that file was reviewed&rdquo; from
+          &ldquo;that file exists but was not read&rdquo;.
+        </P>
+        <DocTable
+          head={["Depth", "What the reviewer sees", "Put your work where"]}
+          rows={[
+            [
+              "Quick review",
+              "Around 15 files, ranked by relevance to the milestone, most of them as excerpts",
+              "The files that implement the milestone should be obvious from its description — that is what the ranking reads",
+            ],
+            [
+              "Deep review",
+              "Up to 40 files, most of them whole, plus a demand to account for each one and for how they connect",
+              "Cross-file work pays off here: a guard in one file used by another is visible",
             ],
           ]}
         />

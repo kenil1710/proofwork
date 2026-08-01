@@ -22,6 +22,7 @@ import {
   hasEvidence,
   milestonePayout,
   milestoneShare,
+  REVIEW_DEPTHS,
   type Job,
   type Milestone,
 } from "@/types";
@@ -270,6 +271,16 @@ export function MilestoneCard({
         </div>
       ) : null}
 
+      {scored ? (
+        // Attached to the verdict rather than to the job header alone, because
+        // this is the number the depth actually qualifies: how much of the
+        // repository was in front of the reviewer when it scored.
+        <p className="mt-3 text-xs text-surface-500">
+          Verified by {REVIEW_DEPTHS[job.review_depth].label.toLowerCase()} —{" "}
+          {REVIEW_DEPTHS[job.review_depth].reads}.
+        </p>
+      ) : null}
+
       {scored && milestone.reasoning ? (
         <details className="mt-5 border-t border-surface-800 pt-5">
           <summary className="cursor-pointer text-sm font-medium text-surface-200">
@@ -358,6 +369,12 @@ export function MilestoneCard({
         details={[
           { label: "Milestone share", value: `${milestone.percentage}% · ${formatGen(share)} GEN` },
           { label: "Pays out at", value: "70 or above" },
+          // Whoever presses this pays the gas and waits, and a deep review is
+          // the slower of the two — say so before the wallet opens.
+          {
+            label: "Review depth",
+            value: `${REVIEW_DEPTHS[job.review_depth].label} · ${REVIEW_DEPTHS[job.review_depth].reads}`,
+          },
         ]}
         effects={[
           "Your wallet asks you to approve the transaction — you pay the gas, whoever you are.",

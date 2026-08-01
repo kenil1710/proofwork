@@ -19,7 +19,8 @@ import {
 } from "@/lib/contract";
 import { explorerUrl } from "@/lib/genlayer";
 import { formatGen, parseGen } from "@/lib/units";
-import { MAX_STAKE_PCT } from "@/types";
+import { MAX_STAKE_PCT, REVIEW_DEPTHS } from "@/types";
+import type { ReviewDepth } from "@/types";
 
 type MilestoneDraft = { id: number; description: string; percentage: string };
 
@@ -73,6 +74,10 @@ export default function CreateJobPage() {
   // 10% is enough of a stake to deter a no-show without pricing out freelancers.
   const [deadlineDays, setDeadlineDays] = useState("7");
   const [stakePct, setStakePct] = useState("10");
+  // Quick by default. Deep costs the freelancer nothing, but it costs every
+  // validator real fetches and a much longer prompt, so it is opted into for
+  // the jobs that warrant it rather than paid for on every small one.
+  const [reviewDepth, setReviewDepth] = useState<ReviewDepth>("quick");
   // Start with a single milestone at the full 100. Most jobs are one
   // deliverable, and a valid-by-default form is better than one that opens
   // already failing its own total check.
@@ -229,6 +234,7 @@ export default function CreateJobPage() {
           depositBaseUnits,
           deadlineDays: validation.deadlineDays as number,
           stakePercentage: validation.stakePercentage as number,
+          reviewDepth,
         }),
       {
         onAccepted: async () => {
@@ -648,6 +654,61 @@ export default function CreateJobPage() {
           </div>
         </fieldset>
 
+        {/* ── Review depth ────────────────────────────────────────────────
+            Fixed at creation and not changeable later, because every
+            validator has to derive the same reading plan from stored state —
+            so this radio is the only chance to choose it. Said plainly on the
+            control rather than left to the docs. */}
+        <fieldset className="panel p-5">
+          <legend className={`${labelClass} px-2`}>How thoroughly to verify</legend>
+
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            {(["quick", "deep"] as const).map((value) => {
+              const depth = REVIEW_DEPTHS[value];
+              const selected = reviewDepth === value;
+              return (
+                <label
+                  key={value}
+                  className={`flex cursor-pointer gap-3 border p-4 transition-colors ${
+                    selected
+                      ? "border-orchid-400/60 bg-orchid-400/5"
+                      : "border-surface-800 hover:border-surface-700"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="review-depth"
+                    value={value}
+                    checked={selected}
+                    onChange={() => setReviewDepth(value)}
+                    className="mt-1 h-4 w-4 shrink-0 accent-orchid-400"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm text-surface-100">
+                      {depth.label}
+                      {value === "quick" ? (
+                        <span className="text-surface-500"> — default</span>
+                      ) : null}
+                    </span>
+                    <span className="mt-1 block text-sm text-surface-400">
+                      {depth.summary} {depth.detail}
+                    </span>
+                    <span className="mt-2 block text-xs text-surface-500 tabular-nums">
+                      {depth.reads} · verification takes {depth.estimate}
+                    </span>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+
+          <p className={hintClass}>
+            This is fixed once the job is created — every validator reads the
+            same amount of the repository, so it cannot be changed per
+            milestone or per verification.
+          </p>
+        </fieldset>
+
         <div className="border-t border-surface-800 pt-8">
           {!walletAvailable ? (
             <p className="text-sm text-surface-400">
@@ -700,6 +761,12 @@ export default function CreateJobPage() {
             value: `${milestones.length} · ${milestones
               .map((m) => `${parsePercentage(m.percentage) ?? 0}%`)
               .join(" / ")}`,
+          },
+          // Listed here because it cannot be changed afterwards, and the
+          // confirmation is the last point at which a client can go back.
+          {
+            label: "Verification",
+            value: `${REVIEW_DEPTHS[reviewDepth].label} · ${REVIEW_DEPTHS[reviewDepth].reads}`,
           },
         ]}
         effects={[
