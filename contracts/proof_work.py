@@ -358,14 +358,24 @@ def _evidence_prompt(
     requirements: str,
     weights: dict,
     has_shots: bool,
+    inventory: str = "",
+    kind: str = "",
 ) -> str:
     """
-    One prompt covering all four criteria.
+    One prompt covering all four criteria, aimed at the kind of project it is.
 
     Previously this was four separate prompts in four separate consensus
     blocks. Asking for all four scores at once is not just cheaper — it also
     lets the model see the whole deliverable before scoring any one axis,
     which is how a human reviewer would do it.
+
+    `inventory` and `kind` come off the tree listing, and they are what make one
+    prompt work for every project type. Without them the reviewer is handed a
+    ranked sample with no idea what it is a sample OF: it cannot tell 5 files
+    out of 5 from 12 out of 400, and it reviews a Solidity escrow with whatever
+    criteria it would apply to a React page. Both default to empty so the
+    non-GitHub render path — which has no listing to derive them from — still
+    produces a valid prompt.
     """
     if code_text:
         # Said explicitly because it is the difference between "this feature is
@@ -422,6 +432,26 @@ def _evidence_prompt(
     # criteria below it were headed `code_quality` and `functionality`.
     applicable = [SCORE_ALIASES[k][0] for k in SCORE_KEYS if int(weights.get(k, 0)) > 0]
 
+    # What the repository IS, ahead of the excerpt from it. Stated before the
+    # code because it changes how the code should be read: 12 files out of 400
+    # is a sample and 5 out of 5 is the deliverable, and a reviewer who cannot
+    # tell them apart scores `completeness` off an accident of ranking.
+    if inventory:
+        inventory_section = f"WHAT THIS REPOSITORY IS:\n{inventory}"
+    else:
+        inventory_section = ""
+
+    # The type-aware half. A Solidity contract and a React screen are not
+    # well-written in the same way, and one rubric applied to both scores
+    # whichever it was written for.
+    if kind:
+        criteria_section = (
+            f"HOW TO REVIEW THIS KIND OF PROJECT ({KIND_NAMES.get(kind, kind)}):\n"
+            f"{_kind_guidance(kind)}"
+        )
+    else:
+        criteria_section = ""
+
     return f"""You are reviewing a freelance deliverable against its milestone.
 Your scores release or withhold real money, so judge the work in front of you on
 its merits — neither generously nor defensively.
@@ -431,6 +461,10 @@ PROJECT REQUIREMENTS:
 
 THIS MILESTONE:
 {milestone_desc}
+
+{inventory_section}
+
+{criteria_section}
 
 {code_section}
 
@@ -850,6 +884,71 @@ KIND_NAMES = {
 Kept beside the guidance rather than inlined at the two call sites, so the
 inventory paragraph and the review criteria can never disagree about what the
 project was classified as."""
+
+KIND_GUIDANCE = {
+    "contracts": (
+        "Weigh access control (who may call what, and is it enforced), value "
+        "handling and arithmetic, reentrancy and external-call ordering, and "
+        "whether state changes emit events. A contract that merely compiles is "
+        "not a contract that is safe to hold funds. Any front end in this "
+        "repository is secondary to the contracts themselves."
+    ),
+    "ml": (
+        "Weigh the pipeline, not the accuracy number: how data is loaded and "
+        "split, whether the split can leak between train and test, whether the "
+        "metric reported suits the task, and whether a run is reproducible "
+        "(a fixed seed, pinned dependencies). Training and inference should be "
+        "separable. A notebook that reports 0.99 with the test set in the "
+        "training data has delivered nothing."
+    ),
+    "mobile": (
+        "Weigh screen and navigation structure, how state survives the "
+        "lifecycle, platform permissions actually being requested, and what "
+        "the app does with no network. Layout code that only works at one "
+        "screen size is incomplete."
+    ),
+    "fullstack": (
+        "Weigh both halves and the boundary between them: whether the client "
+        "validates for convenience while the server validates for safety, "
+        "whether errors crossing the boundary reach the user as something "
+        "actionable, and whether the two agree on the shape of the data."
+    ),
+    "frontend": (
+        "Weigh component structure and reuse, where state lives and whether it "
+        "belongs there, loading and error states existing at all, and "
+        "accessibility basics — real controls, labels, keyboard reachability. "
+        "A screen that only renders the happy path is half-built."
+    ),
+    "backend": (
+        "Weigh request validation at the boundary, error handling and the "
+        "status codes actually returned, how persistence is structured, and "
+        "whether authentication and authorisation are enforced per route "
+        "rather than assumed. Secrets belong in configuration, never in source."
+    ),
+    "general": (
+        "Weigh structure, naming, error handling and whether the code does "
+        "what the milestone describes."
+    ),
+}
+"""What to look FOR, by project kind — the type-aware half of the review.
+
+A Solidity contract and a React screen are not well-written in the same way,
+and a single rubric applied to both scores whichever one it was written for.
+The universal calibration bands stay the same; what changes is which properties
+count as evidence of quality.
+
+Deliberately short. This is a lens, not a checklist to be worked through: a
+long enumeration invites the model to score the list rather than the code, and
+to penalise a milestone for omitting something it was never asked to build."""
+
+
+def _kind_guidance(kind: str) -> str:
+    """The review criteria for a project kind, falling back to the general set.
+
+    Every label `_project_kind` can return has an entry — asserted in the
+    offline tests, because a missing one would silently drop the type-aware
+    half of the prompt rather than failing."""
+    return str(KIND_GUIDANCE.get(kind, KIND_GUIDANCE["general"]))
 
 SIZE_SMALL_MAX = 20
 """At or below this many source files, the whole repository is readable.
@@ -2578,6 +2677,8 @@ def _gather_and_score(
         requirements,
         weights,
         bool(shots),
+        str(ev["inventory"]),
+        str(ev["kind"]),
     )
 
     if shots:

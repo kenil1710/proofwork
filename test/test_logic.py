@@ -888,6 +888,54 @@ check("non-github short-circuits",
 check("and claims no inventory",
       pw._fetch_github_code("https://gitlab.com/a/b")["kind"], "")
 
+print("\n_kind_guidance — a Solidity contract is not well-written like a React screen")
+for _kind in ("contracts", "ml", "mobile", "fullstack", "frontend", "backend", "general"):
+    # A missing entry would silently drop the type-aware half of the prompt
+    # rather than failing, so every label the classifier can return is asserted.
+    check(f"{_kind} has guidance", len(pw._kind_guidance(_kind)) > 40, True)
+check("an unknown kind falls back rather than emptying",
+      pw._kind_guidance("wat"), pw.KIND_GUIDANCE["general"])
+check("contracts guidance is about custody",
+      "reentrancy" in pw._kind_guidance("contracts"), True)
+check("frontend guidance is about the interface",
+      "accessibility" in pw._kind_guidance("frontend"), True)
+check("ml guidance is about the pipeline, not the accuracy number",
+      "leak" in pw._kind_guidance("ml"), True)
+check("the kinds actually differ",
+      pw._kind_guidance("contracts") == pw._kind_guidance("frontend"), False)
+
+print("\n_evidence_prompt — universal rubric, type-aware lens")
+W = {"code": 35, "design": 0, "functionality": 35, "completeness": 30}
+INV = "142 files, 78 of them source (61 TypeScript, 12 Solidity). Reviewed as: a smart-contract project."
+prompt = pw._evidence_prompt("// FILE: a.sol\n   1| contract X {}", "", "Ship the escrow",
+                             "Build an escrow", W, False, INV, "contracts")
+check("inventory reaches the prompt", INV in prompt, True)
+check("inventory is labelled", "WHAT THIS REPOSITORY IS" in prompt, True)
+check("kind named in words a reviewer uses",
+      "a smart-contract project" in prompt, True)
+check("kind-specific criteria included",
+      "reentrancy" in prompt, True)
+check("the universal calibration survives", "90-100" in prompt, True)
+check("citations still demanded", "path/to/file.ext:LINE" in prompt, True)
+check("JSON contract still last", prompt.rstrip().endswith("}"), True)
+
+# The same evidence, classified differently, must produce a different review.
+other = pw._evidence_prompt("// FILE: a.tsx\n   1| export const A = () => null",
+                            "", "Ship the dashboard", "Build a dashboard", W, False,
+                            INV, "frontend")
+check("a different kind asks for different things",
+      "reentrancy" in other, False)
+check("and supplies its own", "accessibility" in other, True)
+
+# The non-GitHub render path has no listing to derive either from, and must
+# still produce a valid prompt rather than headers with nothing under them.
+bare = pw._evidence_prompt("rendered page text", "", "Ship it", "Build it", W, False)
+check("no inventory section when there is no inventory",
+      "WHAT THIS REPOSITORY IS" in bare, False)
+check("no criteria section when the kind is unknown",
+      "HOW TO REVIEW THIS KIND" in bare, False)
+check("the rubric is still there", "90-100" in bare, True)
+
 print("\nevidence fingerprinting")
 check("whitespace collapsed", pw._normalize("a  b\n\tc "), "a b c")
 long_page = "Example Domain " * 40

@@ -249,6 +249,8 @@ def main():
     site_text = str(evidence["site_text"])
     print(f"  code_len {evidence['code_len']}   code_fp {evidence['code_fp']!r}")
     print(f"  site_len {evidence['site_len']}   site_fp {evidence['site_fp']!r}")
+    print(f"  kind     {evidence['kind']!r}     inv_fp  {evidence['inv_fp']!r}")
+    print(f"  slots    {evidence['read']} filled of {evidence['planned']} planned")
 
     html = RENDERED_HTML.get(site_url, "")
     if html and len(site_text) < 200:
@@ -265,6 +267,8 @@ def main():
         str(fields["requirements"]),
         weights,
         bool(has_site and has_mockup and int(weights["design"]) > 0),
+        str(evidence["inventory"]),
+        str(evidence["kind"]),
     )
     print(prompt)
     rule(f"END OF PROMPT — {len(prompt)} chars")
