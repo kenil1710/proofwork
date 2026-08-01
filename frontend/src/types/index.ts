@@ -277,3 +277,72 @@ export function milestoneShare(
 ): bigint {
   return (totalAmount / 100n) * BigInt(percentage);
 }
+
+/** A job the contract has finished with: it holds no escrow for it any more. */
+export function isSettled(status: JobStatus): boolean {
+  return (
+    status === "completed" || status === "cancelled" || status === "abandoned"
+  );
+}
+
+/**
+ * What the contract still holds for this job, in base units.
+ *
+ * Deliberately not plain `total_amount - paid_out`. The two settled paths
+ * account for themselves differently: `abandon_job` raises `paid_out` to the
+ * full escrow before refunding, while `cancel_job` refunds everything and never
+ * touches `paid_out` at all — so subtraction alone reports a cancelled job as
+ * still holding its whole deposit. What is true of all three settled states is
+ * that the contract holds nothing, so that is what is checked first.
+ */
+export function escrowRemaining(job: Job): bigint {
+  if (isSettled(job.status)) return 0n;
+  const remaining = job.total_amount - job.paid_out;
+  return remaining > 0n ? remaining : 0n;
+}
+
+/** Where a settled job's escrow actually went. All figures in base units. */
+export interface Settlement {
+  /** Milestone payouts, at the rate each score band released. */
+  toFreelancer: bigint;
+  /**
+   * Escrow the freelancer never earned, back to the client: the 10-30% the
+   * score bands withheld on a completed job, or everything unearned plus the
+   * forfeited stake on an abandoned one.
+   */
+  toClient: bigint;
+  /** The freelancer's own stake coming back, which only completion returns. */
+  stakeToFreelancer: bigint;
+}
+
+/**
+ * Reconstructs a settled job's disbursement from its milestones.
+ *
+ * It cannot be read off the job alone: both settled paths overwrite `paid_out`
+ * with the full escrow on the way out, which is exactly what makes it useless
+ * afterwards for saying who got what. Summing the milestone payouts recovers
+ * the split, using the same truncating arithmetic the contract used.
+ */
+export function settlement(job: Job, milestones: Milestone[]): Settlement {
+  const toFreelancer = milestones.reduce(
+    (sum, milestone) =>
+      sum +
+      milestonePayout(
+        job.total_amount,
+        milestone.percentage,
+        milestone.scores.final_weighted,
+      ),
+    0n,
+  );
+
+  const unearned = job.total_amount - toFreelancer;
+  const forfeitedStake =
+    job.status === "abandoned" ? job.required_stake : 0n;
+
+  return {
+    toFreelancer,
+    toClient: (unearned > 0n ? unearned : 0n) + forfeitedStake,
+    stakeToFreelancer:
+      job.status === "completed" ? job.required_stake : 0n,
+  };
+}

@@ -16,7 +16,8 @@
  *  2. A revert does not throw. The transaction is ACCEPTED with
  *     `txExecutionResultName === "FINISHED_WITH_ERROR"`, and the message exists
  *     only as bytes in the debug trace. `waitForWrite` turns that back into a
- *     thrown `ContractWriteError` carrying the contract's own wording.
+ *     thrown `ContractWriteError` carrying the user-facing sentence for that
+ *     failure — see `lib/contract-errors.ts`.
  *  3. Reads lag accepted writes. The next `readContract` after a write can
  *     still serve pre-write state, so callers follow a write with
  *     `waitForState` rather than reading once.
@@ -34,6 +35,7 @@ import {
   getReadClient,
   getWalletClient,
 } from "./genlayer";
+import { describeContractError, stripErrorClass } from "./contract-errors";
 import { MAX_STAKE_PCT, SECONDS_PER_DAY } from "@/types";
 import type { Job, Milestone, Reputation } from "@/types";
 
@@ -465,51 +467,6 @@ function executionResultOf(
   return null;
 }
 
-/**
- * Every `gl.vm.UserError` the contract can raise.
- *
- * The debug trace hands back a mostly-binary blob with the error text sitting
- * in it as plain bytes. Matching against the known set turns that dump into the
- * contract's actual sentence; anything unmatched falls back to the printable
- * runs, which is ugly but still more use than nothing.
- */
-const CONTRACT_ERRORS = [
-  "Must deposit GEN for escrow",
-  "Milestone descriptions and percentages must match",
-  "Milestone percentages must sum to 100",
-  "Client cannot accept their own job",
-  "Job already taken",
-  "Job is not open",
-  "Only assigned freelancer can submit",
-  "Job is not in progress",
-  "Milestone not awaiting submission",
-  "Milestone not submitted for review",
-  "Must provide at least a GitHub URL or deployed site URL",
-  "Only client can cancel",
-  "Can only cancel open jobs",
-  // Raised from inside the verification block. The contract prefixes these with
-  // an error class ([EXPECTED]/[EXTERNAL]/[LLM_ERROR]) that tells validators how
-  // to compare failures; matching on the sentence alone covers both forms.
-  "No evidence could be fetched from the submitted URLs",
-  "Could not read a JSON score object from the model's reply",
-  "Non-numeric score for",
-] as const;
-
-/**
- * Turns a matched contract error into something a user can act on.
- *
- * The verification errors in particular are meaningless as raw text: "[LLM_ERROR]
- * Could not read a JSON score object" tells a freelancer nothing about what to do.
- */
-const ERROR_ADVICE: Record<string, string> = {
-  "No evidence could be fetched from the submitted URLs":
-    "None of the submitted URLs could be loaded. Check they are public and reachable, then verify again.",
-  "Could not read a JSON score object from the model's reply":
-    "The AI reviewer returned an unreadable response. Nothing was changed — verify again to retry with a different validator set.",
-  "Non-numeric score for":
-    "The AI reviewer returned a malformed score. Nothing was changed — verify again to retry.",
-};
-
 /** Hex → latin1. `Buffer` is Node-only, and this runs in the browser. */
 function hexToLatin1(hex: string): string {
   // Cap the work: traces carry memory pages and storage diffs, and the error
@@ -522,7 +479,15 @@ function hexToLatin1(hex: string): string {
   return out;
 }
 
-/** Recovers a reverted transaction's message from the debug trace. */
+/**
+ * Recovers a reverted transaction's message from the debug trace.
+ *
+ * The trace is a mostly-binary blob with the error text sitting in it as plain
+ * bytes, so the catalogue is matched against the whole decode. Only when
+ * nothing matches does this fall back to the printable runs — which is ugly,
+ * and mangles any sentence containing an em dash (a non-ASCII byte ends the
+ * run), but still beats showing nothing.
+ */
 async function revertMessage(hash: TransactionHash): Promise<string> {
   try {
     const trace = await withTimeout(
@@ -534,13 +499,13 @@ async function revertMessage(hash: TransactionHash): Promise<string> {
     if (typeof data !== "string" || !data.startsWith("0x")) return "";
 
     const decoded = hexToLatin1(data.slice(2));
-    const known = CONTRACT_ERRORS.find((message) => decoded.includes(message));
-    if (known) return ERROR_ADVICE[known] ?? known;
+    const known = describeContractError(decoded);
+    if (known) return known;
 
-    // Keep only printable runs — turns an unreadable dump into something a
-    // person can at least skim.
+    // Keep only printable runs, with any class prefix dropped — turns an
+    // unreadable dump into something a person can at least skim.
     const runs = decoded.match(/[\x20-\x7E]{6,}/g) ?? [];
-    return runs.join(" | ").slice(0, 300);
+    return stripErrorClass(runs.join(" | ")).slice(0, 300);
   } catch {
     return "";
   }
@@ -606,11 +571,16 @@ export async function waitForWrite(
         ExecutionResult.FINISHED_WITH_ERROR) {
         // Studio hands back the UserError already decoded, so prefer it and
         // skip the trace fetch and hex scraping that Bradbury still needs.
+        //
+        // Still routed through the catalogue rather than shown as-is: the raw
+        // string carries the `[EXTERNAL]`-style consensus prefix and the
+        // contract's own interpolations (repo slugs, base-unit amounts), none
+        // of which mean anything to the person who pressed the button.
         const payload = studioLeaderReceipt(tx as GenLayerTransaction | null)
           ?.result?.payload;
         const message =
           typeof payload === "string" && payload
-            ? payload
+            ? (describeContractError(payload) ?? stripErrorClass(payload))
             : await revertMessage(hash);
         throw new ContractWriteError(
           message || "The contract rejected this transaction.",

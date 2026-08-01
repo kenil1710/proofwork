@@ -26,7 +26,7 @@ import {
 } from "@/lib/contract";
 import { explorerUrl } from "@/lib/genlayer";
 import { formatGen } from "@/lib/units";
-import { canAbandon } from "@/types";
+import { canAbandon, escrowRemaining, isSettled, settlement } from "@/types";
 import type { Job, Milestone } from "@/types";
 
 type LoadState =
@@ -186,10 +186,12 @@ export function JobDetail({ jobId }: { jobId: number }) {
   // Mirrors the contract's guard exactly — see `canAbandon` in @/types. Any
   // looser condition offers a button whose transaction can only revert.
   const showAbandon = canAbandon(job, account);
-  const settled =
-    job.status === "completed" ||
-    job.status === "cancelled" ||
-    job.status === "abandoned";
+  const settled = isSettled(job.status);
+  // What the contract still holds, and — once it holds nothing — where it went.
+  // Both are derived rather than read straight off `paid_out`, which the settled
+  // paths overwrite; see `escrowRemaining` and `settlement` in @/types.
+  const remainingEscrow = escrowRemaining(job);
+  const disbursed = settlement(job, milestones);
 
   async function handleAccept() {
     // The job's own `required_stake`, never a figure recomputed from the
@@ -252,12 +254,29 @@ export function JobDetail({ jobId }: { jobId: number }) {
       <dl className="mt-8 grid gap-6 panel p-6 sm:grid-cols-2 lg:grid-cols-4">
         <div className="flex flex-col gap-1">
           <dt className="text-xs tracking-[0.15em] text-surface-600 uppercase">
-            <Tooltip term="In escrow">{GLOSSARY.escrow}</Tooltip>
+            <Tooltip term={settled ? "Escrow" : "In escrow"}>
+              {GLOSSARY.escrow}
+            </Tooltip>
           </dt>
-          <dd className="text-lg tabular-nums text-surface-100">
-            {formatGen(job.total_amount)}{" "}
-            <Tooltip term="GEN">{GLOSSARY.gen}</Tooltip>
-          </dd>
+          {/*
+            The amount still held, never the original deposit. A completed job
+            has paid its escrow out and refunded whatever the score bands
+            withheld, so showing `total_amount` here told the client money was
+            locked up that had already been returned to them.
+          */}
+          {settled ? (
+            <dd className="text-lg text-surface-100">
+              Settled
+              <span className="ml-2 text-sm text-surface-500 tabular-nums">
+                0 GEN held
+              </span>
+            </dd>
+          ) : (
+            <dd className="text-lg tabular-nums text-surface-100">
+              {formatGen(remainingEscrow)}{" "}
+              <Tooltip term="GEN">{GLOSSARY.gen}</Tooltip>
+            </dd>
+          )}
         </div>
         <div className="flex flex-col gap-1">
           <dt className="text-xs tracking-[0.15em] text-surface-600 uppercase">
@@ -426,7 +445,7 @@ export function JobDetail({ jobId }: { jobId: number }) {
             {job.milestone_count} milestones are still unverified. Abandoning
             returns the{" "}
             <span className="tabular-nums text-surface-200">
-              {formatGen(job.total_amount - job.paid_out)} GEN
+              {formatGen(remainingEscrow)} GEN
             </span>{" "}
             still in escrow
             {job.freelancer_stake > 0n ? (
@@ -455,8 +474,14 @@ export function JobDetail({ jobId }: { jobId: number }) {
 
       {job.status === "abandoned" ? (
         <div className="mt-10">
+          {/*
+            Reconstructed from the milestones, not from `total_amount -
+            paid_out`: `abandon_job` sets `paid_out` to the full escrow on its
+            way out, so that subtraction is always zero afterwards and this
+            notice used to claim nothing had been returned at all.
+          */}
           <PayoutNotice
-            amountBaseUnits={job.total_amount - job.paid_out}
+            amountBaseUnits={disbursed.toClient}
             recipient={isClient ? "you" : "the client"}
             hash={abandon.state.phase === "done" ? abandon.state.hash : undefined}
           />
@@ -471,6 +496,54 @@ export function JobDetail({ jobId }: { jobId: number }) {
             hash={cancel.state.phase === "done" ? cancel.state.hash : undefined}
           />
         </div>
+      ) : null}
+
+      {job.status === "completed" ? (
+        <section className="mt-10 panel p-6">
+          <h2 className="text-base font-medium text-surface-100">
+            Escrow settled
+          </h2>
+          <p className="mt-2 text-sm text-surface-400">
+            Every milestone was verified and the contract holds nothing further
+            for this job.
+          </p>
+          <dl className="mt-4 space-y-2 text-sm">
+            <div className="flex justify-between gap-4">
+              <dt className="text-surface-400">Released to the freelancer</dt>
+              <dd className="tabular-nums text-surface-200">
+                {formatGen(disbursed.toFreelancer)} GEN
+              </dd>
+            </div>
+            {disbursed.toClient > 0n ? (
+              <div className="flex justify-between gap-4">
+                {/* The 10-30% a sub-90 band withholds. It has nowhere else to
+                    go once the last milestone verifies, so the contract sends
+                    it back — and the client is otherwise never told. */}
+                <dt className="text-surface-400">
+                  Returned to the client, unearned by score
+                </dt>
+                <dd className="tabular-nums text-surface-200">
+                  {formatGen(disbursed.toClient)} GEN
+                </dd>
+              </div>
+            ) : null}
+            {disbursed.stakeToFreelancer > 0n ? (
+              <div className="flex justify-between gap-4">
+                <dt className="text-surface-400">
+                  Stake returned to the freelancer
+                </dt>
+                <dd className="tabular-nums text-surface-200">
+                  {formatGen(disbursed.stakeToFreelancer)} GEN
+                </dd>
+              </div>
+            ) : null}
+          </dl>
+          <p className="mt-4 text-xs text-surface-500">
+            Transfers apply on finalization, which is a later step than
+            acceptance — check a balance or the explorer to confirm they have
+            landed.
+          </p>
+        </section>
       ) : null}
 
       <section className="mt-12">
@@ -566,7 +639,7 @@ export function JobDetail({ jobId }: { jobId: number }) {
         details={[
           {
             label: "Escrow returned",
-            value: `${formatGen(job.total_amount - job.paid_out)} GEN`,
+            value: `${formatGen(remainingEscrow)} GEN`,
           },
           {
             label: "Stake forfeited to you",

@@ -260,7 +260,7 @@ Contact form, dark mode, deployment     30%`}
     title: "For freelancers",
     navLabel: "For freelancers",
     keywords:
-      "freelancers submit evidence github repo url site deployed mockup public private cloudflare screenshot resubmit rejected accept job",
+      "freelancers submit evidence github repo url site deployed mockup public private cloudflare screenshot resubmit rejected accept job insufficient evidence not scored verification stopped could not read repository rate limited retry",
     body: (
       <>
         <P>
@@ -288,8 +288,18 @@ Contact form, dark mode, deployment     30%`}
         <DocTable
           head={["Problem", "What happens"]}
           rows={[
-            ["Private repository", "Code cannot be read — code quality scores 0"],
-            ["Site behind a login", "Page cannot be rendered — functionality scores 0"],
+            [
+              "Private repository",
+              "The repository cannot even be listed, so verification stops with insufficient evidence. Nothing is scored and the milestone stays submitted",
+            ],
+            [
+              "Repository readable but its files are not",
+              "If too few files come back, verification stops rather than scoring what little it saw",
+            ],
+            [
+              "Site behind a login",
+              "The page cannot be rendered. With a repository supplied the milestone is still scored on that; with no other evidence, verification stops",
+            ],
             ["Figma not shared publicly", "Design match cannot be assessed"],
             [
               "Host uses bot protection",
@@ -297,6 +307,39 @@ Contact form, dark mode, deployment     30%`}
             ],
           ]}
         />
+
+        <H3>Insufficient evidence is not a bad score</H3>
+        <P>
+          These two outcomes look similar from the button and are completely
+          different underneath. A <strong>score</strong> means validators read
+          your work and judged it. <strong>Insufficient evidence</strong> means
+          they could not read enough of it to judge anything, so the contract
+          refuses to score rather than publishing a low number that reads like a
+          verdict on your work.
+        </P>
+        <DocTable
+          head={["Outcome", "Milestone becomes", "What to do"]}
+          rows={[
+            ["Scored 70 or above", "Verified, and its share pays out", "Nothing"],
+            [
+              "Scored below 70",
+              "Rejected — the work was read and found short",
+              "Improve the work and submit again",
+            ],
+            [
+              "Insufficient evidence",
+              "Unchanged: still submitted, nothing recorded",
+              "Fix the URL or its permissions, then verify again — no resubmission needed",
+            ],
+          ]}
+        />
+        <P>
+          Nothing is spent from escrow when verification stops this way, and no
+          score is written against your reputation. It costs only the gas of the
+          attempt, so retrying after fixing access is cheap. A verification that
+          fails because GitHub was briefly unreachable or rate-limited behaves
+          the same way — wait a moment and trigger it again.
+        </P>
 
         <H3>If a milestone is rejected</H3>
         <P>
@@ -587,7 +630,7 @@ final = (90 * 50 + 80 * 50) / 100 = 85
     title: "FAQ",
     navLabel: "FAQ",
     keywords:
-      "faq questions answers can the ai run my code spa react rendering bad requirements resubmit gas who pays no frontend appeal dispute",
+      "faq questions answers can the ai run my code spa react rendering bad requirements resubmit gas who pays no frontend appeal dispute insufficient evidence could not be read scored badly",
     body: (
       <>
         <Faq
@@ -605,6 +648,10 @@ final = (90 * 50 + 80 * 50) / 100 = 85
         <Faq
           q="Can I resubmit a rejected milestone?"
           a="Yes. Submit it again with updated URLs and it is verified from scratch. Rejection releases nothing but does not end the job."
+        />
+        <Faq
+          q="Verification failed saying the evidence could not be read. Was I scored badly?"
+          a="No — nothing was scored. When too little of the repository or site can be read, the contract stops instead of publishing a number that would look like a judgement on your work. The milestone stays submitted, no score is recorded, and nothing leaves escrow. Fix the access problem and verify again; there is no need to resubmit."
         />
         <Faq
           q="Who pays gas for verification?"
