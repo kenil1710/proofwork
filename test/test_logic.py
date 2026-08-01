@@ -634,6 +634,8 @@ code = _text(ev)
 check("exactly one metered call", calls["api"], 1)
 check("README included", "// FILE: README.md" in code, True)
 check("manifest included", "// FILE: package.json" in code, True)
+check("manifest labelled as one, not as source",
+      "package.json (" in code and "dependency manifest" in code, True)
 check("source included", "// FILE: src/index.ts" in code, True)
 check("real content reaches the prompt", "export const a = 1" in code, True)
 check("no Response repr leaks in", "Response(" in code, False)

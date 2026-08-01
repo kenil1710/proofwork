@@ -1752,6 +1752,13 @@ def _file_role(path: str) -> str:
 
     if name.startswith("readme"):
         return "project README"
+    if name in MANIFEST_FILENAMES:
+        # Fetched deliberately by pass 1, never ranked as source, and labelled
+        # for what it is: a reviewer told "dependency manifest" reads it as the
+        # project's declaration of its stack rather than as somebody's code.
+        return "dependency manifest"
+    if lowered.endswith(".ipynb"):
+        return "Jupyter notebook (JSON source)"
     for directory in parents:
         if directory in ("components", "component", "widgets"):
             return "UI component"
