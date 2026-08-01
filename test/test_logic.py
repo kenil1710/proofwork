@@ -75,31 +75,48 @@ def check(label, got, want):
         print(f"  ok   {label}")
 
 
+def check_scores(label, got, want):
+    """Compare the four score axes, ignoring `reasoning`.
+
+    `_extract_scores` also returns the model's written justification, which is
+    display-only and never gates a payout. Asserting on it here would couple
+    every scoring test to prose."""
+    check(label, {k: v for k, v in got.items() if k in pw.SCORE_KEYS}, want)
+
+
+def check_repo(label, got, want):
+    """Compare owner/repo/branch, ignoring `subpath`.
+
+    Cases that are not ABOUT the linked subdirectory should not have to restate
+    that it is empty; the ones that are assert on the full dict."""
+    check(label, {k: v for k, v in got.items() if k != "subpath"}, want)
+
+
 # The weight branches verify_milestone picks from, by evidence supplied.
 W_ALL = {"code": 25, "design": 25, "functionality": 25, "completeness": 25}
 W_CODE_ONLY = {"code": 50, "design": 0, "functionality": 0, "completeness": 50}
 
 print("\n_extract_scores — shapes a model actually returns")
 clean = '{"code_quality": 85, "design_match": 90, "functionality": 80, "completeness": 88}'
-check("clean json", pw._extract_scores(clean, W_ALL),
+check_scores("clean json", pw._extract_scores(clean, W_ALL),
       {"code": 85, "design": 90, "functionality": 80, "completeness": 88})
-check("fenced json", pw._extract_scores("```json\n" + clean + "\n```", W_ALL),
+check_scores("fenced json", pw._extract_scores("```json\n" + clean + "\n```", W_ALL),
       {"code": 85, "design": 90, "functionality": 80, "completeness": 88})
-check("chatty prose", pw._extract_scores("Here you go:\n" + clean + "\nHope that helps!", W_ALL),
+check_scores("chatty prose", pw._extract_scores("Here you go:\n" + clean + "\nHope that helps!", W_ALL),
       {"code": 85, "design": 90, "functionality": 80, "completeness": 88})
-check("dict passthrough", pw._extract_scores(json.loads(clean), W_ALL),
+check_scores("dict passthrough", pw._extract_scores(json.loads(clean), W_ALL),
       {"code": 85, "design": 90, "functionality": 80, "completeness": 88})
-check("float + string values",
+check_scores("float + string values",
       pw._extract_scores('{"code_quality": 84.6, "design_match": "90", "functionality": " 80 ", "completeness": 88}', W_ALL),
       {"code": 85, "design": 90, "functionality": 80, "completeness": 88})
-check("out of range clamps",
+check_scores("out of range clamps",
       pw._extract_scores('{"code_quality": 130, "design_match": -5, "functionality": 80, "completeness": 88}', W_ALL),
       {"code": 100, "design": 0, "functionality": 80, "completeness": 88})
 
 # A missing axis is only safe when it carries no weight. Under W_CODE_ONLY
 # design and functionality are multiplied by zero, so their absence cannot move
 # the result and 0 is the honest value.
-check("missing ZERO-weight axis -> 0",
+check_scores("missing ZERO-weight axis -> 0",
       pw._extract_scores('{"code_quality": 85, "completeness": 90}', W_CODE_ONLY),
       {"code": 85, "design": 0, "functionality": 0, "completeness": 90})
 
@@ -190,28 +207,35 @@ for bad in (
     check(f"absent: {bad.strip()[:38]!r}", pw._is_usable_url(bad), False)
 
 print("\n_parse_github_repo — URL shapes people actually paste")
-check("plain repo", pw._parse_github_repo("https://github.com/acme/widget"),
+check_repo("plain repo", pw._parse_github_repo("https://github.com/acme/widget"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("trailing slash", pw._parse_github_repo("https://github.com/acme/widget/"),
+check_repo("trailing slash", pw._parse_github_repo("https://github.com/acme/widget/"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("dot git", pw._parse_github_repo("https://github.com/acme/widget.git"),
+check_repo("dot git", pw._parse_github_repo("https://github.com/acme/widget.git"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("no scheme", pw._parse_github_repo("github.com/acme/widget"),
+check_repo("no scheme", pw._parse_github_repo("github.com/acme/widget"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("www", pw._parse_github_repo("https://www.github.com/acme/widget"),
+check_repo("www", pw._parse_github_repo("https://www.github.com/acme/widget"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("http", pw._parse_github_repo("http://github.com/acme/widget"),
+check_repo("http", pw._parse_github_repo("http://github.com/acme/widget"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("tree branch", pw._parse_github_repo("https://github.com/acme/widget/tree/develop"),
+check_repo("tree branch", pw._parse_github_repo("https://github.com/acme/widget/tree/develop"),
       {"owner": "acme", "repo": "widget", "branch": "develop"})
+# The subpath is the milestone's subject, not decoration — dropping it is what
+# handed a Solidity milestone three React pages. See `_parse_github_repo`.
 check("tree branch with path",
       pw._parse_github_repo("https://github.com/acme/widget/tree/develop/src/lib"),
-      {"owner": "acme", "repo": "widget", "branch": "develop"})
-check("query stripped", pw._parse_github_repo("https://github.com/acme/widget?tab=readme"),
+      {"owner": "acme", "repo": "widget", "branch": "develop", "subpath": "src/lib"})
+check("subpath without tree is not a subpath",
+      pw._parse_github_repo("https://github.com/acme/widget/blob/main/x.py").get("subpath"), "")
+check("deep subpath kept whole",
+      pw._parse_github_repo("https://github.com/a/b/tree/main/packages/core/src").get("subpath"),
+      "packages/core/src")
+check_repo("query stripped", pw._parse_github_repo("https://github.com/acme/widget?tab=readme"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("fragment stripped", pw._parse_github_repo("https://github.com/acme/widget#install"),
+check_repo("fragment stripped", pw._parse_github_repo("https://github.com/acme/widget#install"),
       {"owner": "acme", "repo": "widget", "branch": ""})
-check("whitespace tolerated", pw._parse_github_repo("  https://github.com/acme/widget  "),
+check_repo("whitespace tolerated", pw._parse_github_repo("  https://github.com/acme/widget  "),
       {"owner": "acme", "repo": "widget", "branch": ""})
 # Non-GitHub hosts must fall through to the render path, not be mangled.
 check("gitlab -> {}", pw._parse_github_repo("https://gitlab.com/acme/widget"), {})
@@ -276,7 +300,7 @@ check("lock file dropped", pw._is_source_path("package-lock.json"), False)
 check("webbuild/ is NOT build/", pw._is_source_path("webbuild/app.ts"), True)
 check("a file named dist.ts survives", pw._is_source_path("src/dist.ts"), True)
 
-print("\n_rank_source_files — deterministic, shallowest first")
+print("\n_rank_source_files — deterministic, implementation before wrappers")
 tree = [
     {"type": "blob", "path": "src/deep/nested/thing.ts", "size": 100},
     {"type": "blob", "path": "index.ts", "size": 100},
@@ -286,8 +310,40 @@ tree = [
     {"type": "blob", "path": "node_modules/x/i.js", "size": 100},
     {"type": "blob", "path": "huge.js", "size": 999999},
 ]
-check("ranked shallowest first",
-      pw._rank_source_files(tree), ["index.ts", "src/app.ts", "src/deep/nested/thing.ts"])
+# Entry-point stems (`index`, `app`) rank LAST now. The old key was
+# (depth, path), which is the reverse of what evidence quality wants: shallow
+# means the wrapper, and one level down is where the features live.
+check("entry points rank last",
+      pw._rank_source_files(tree), ["src/deep/nested/thing.ts", "index.ts", "src/app.ts"])
+
+# The ordering that motivated the rewrite. gm-striker's real shape: two wrappers
+# at the conventional paths and every requirement one directory down.
+gm_tree = [
+    {"type": "blob", "path": "src/App.jsx", "size": 1781},
+    {"type": "blob", "path": "src/main.jsx", "size": 1465},
+    {"type": "blob", "path": "src/components/GMButton.jsx", "size": 4336},
+    {"type": "blob", "path": "src/components/StatsCards.jsx", "size": 2547},
+    {"type": "blob", "path": "src/components/Hero.jsx", "size": 334},
+    {"type": "blob", "path": "src/config/chain.js", "size": 439},
+    {"type": "blob", "path": "vite.config.js", "size": 161},
+    {"type": "blob", "path": "src/App.test.jsx", "size": 9000},
+]
+ranked = pw._rank_source_files(gm_tree)
+check("components outrank the entry files",
+      ranked[:3], ["src/components/GMButton.jsx",
+                   "src/components/StatsCards.jsx",
+                   "src/components/Hero.jsx"])
+check("larger component first", ranked.index("src/components/GMButton.jsx") <
+      ranked.index("src/components/StatsCards.jsx"), True)
+# Named config modules are evidence for "config kept in separate modules"; the
+# build tool's own config is not. The rule must separate them by FILENAME, since
+# both live under a path containing "config".
+check("src/config module kept", "src/config/chain.js" in ranked, True)
+check("vite.config.js dropped", "vite.config.js" in ranked, False)
+check("test file dropped despite being the largest",
+      "src/App.test.jsx" in ranked, False)
+check("entry files last, not absent",
+      ranked[-2:], ["src/App.jsx", "src/main.jsx"])
 check("oversized file excluded", "huge.js" in pw._rank_source_files(tree), False)
 check("directories excluded", "src" in pw._rank_source_files(tree), False)
 # Same tree in a different order must rank identically, or an honest validator
@@ -364,40 +420,182 @@ check("404 is NOT transient", pw._is_transient_status(404), False)
 check("200 is NOT transient", pw._is_transient_status(200), False)
 check("401 is NOT transient", pw._is_transient_status(401), False)
 
-print("\n_fetch_github_code — raw first, API only as a last resort")
-TREE = json.dumps({"tree": [
-    {"type": "blob", "path": "README.md", "size": 100},
-    {"type": "blob", "path": "main.py", "size": 100},
-    {"type": "blob", "path": "src/app.ts", "size": 100},
-    {"type": "blob", "path": "src/extra.ts", "size": 100},
-]}).encode()
+print("\n_plan_for — the repository's size decides how much of it is read")
+check("under 20 files is small", pw._plan_for(19)["size"], "small")
+check("exactly 20 is still small", pw._plan_for(20)["size"], "small")
+check("21 is medium", pw._plan_for(21)["size"], "medium")
+check("100 is medium", pw._plan_for(100)["size"], "medium")
+check("101 is large", pw._plan_for(101)["size"], "large")
+check("an empty repo still gets a plan", pw._plan_for(0)["size"], "small")
 
-# The probe list is ordered JS-first, so the ceiling must clear the whole list
-# plus the one README attempt. Below that it does not degrade gracefully: it
-# spends the budget missing on React paths and never reaches main.py, and every
-# Python/Go/Rust repo would score as though it contained no code.
-check("probe ceiling clears the whole list",
-      pw.MAX_RAW_PROBES >= 1 + len(pw.RAW_PROBE_PATHS), True)
-check(".jsx entrypoints are probed",
-      any(p.endswith(".jsx") for p in pw.RAW_PROBE_PATHS), True)
-# The listing walk must NOT share the speculative probe counter. If it did, a
-# repo whose README answered and whose every probe missed would arrive at the
-# listing with the budget spent and fetch nothing from it — README-only evidence,
-# which is the failure the listing exists to prevent.
-check("listing has its own budget",
-      pw.MAX_LISTING_FETCHES >= pw.MAX_SOURCE_FILES, True)
-check("one ref, no branch guessing", pw.GITHUB_DEFAULT_REF, "HEAD")
+SMALL, MEDIUM, LARGE = pw._plan_for(5), pw._plan_for(50), pw._plan_for(400)
+# The trade the three plans encode: depth against breadth. A small repository is
+# read essentially whole; a large one is read wider and shallower, because in a
+# 400-file system the question stops being "is this function well written" and
+# becomes "does this contain the pieces the milestone named".
+check("small reads files whole", SMALL["per_file"] >= 6000, True)
+check("large reads MORE files than medium", LARGE["files"] > MEDIUM["files"], True)
+check("large reads them SHALLOWER", LARGE["per_file"] < MEDIUM["per_file"], True)
+check("large gets the biggest budget", LARGE["budget"] > MEDIUM["budget"], True)
+# files x per_file deliberately exceeds budget in every plan, so the TOTAL binds
+# first and a repo of large files fills fewer slots than the ceiling suggests.
+for _plan in (SMALL, MEDIUM, LARGE):
+    check(f"total binds before the file count ({_plan['size']})",
+          _plan["files"] * _plan["per_file"] > _plan["budget"], True)
+    check(f"plan fits the hard ceiling ({_plan['size']})",
+          _plan["budget"] <= pw.CODE_TEXT_CHARS, True)
 
-# A non-GitHub URL must never reach either path — it returns "" so the caller
-# renders the page, and leader and validators all take that same branch.
-check("non-github short-circuits", pw._fetch_github_code("https://gitlab.com/a/b"), "")
+# Returned fresh, not a shared module constant: the plan crosses into a nondet
+# closure and gets cloudpickled, and a caller mutating it would change the plan
+# for every later evaluation in the same process.
+_p = pw._plan_for(5)
+_p["files"] = 999
+check("plan is a fresh dict", pw._plan_for(5)["files"] == 999, False)
+
+print("\n_detect_languages — what the repository is written in")
+check("histogram, biggest first",
+      pw._detect_languages(["a.py", "b.py", "c.ts"]), [("Python", 2), ("TypeScript", 1)])
+# .tsx must be tested before .ts or every React component counts as plain
+# TypeScript and a front end detects as a backend.
+check("tsx is TypeScript, counted once",
+      pw._detect_languages(["a.tsx", "b.ts"]), [("TypeScript", 2)])
+check("ties resolve by name, not by dict order",
+      pw._detect_languages(["z.go", "a.rs"]), [("Go", 1), ("Rust", 1)])
+check("solidity recognised", pw._detect_languages(["Escrow.sol"]), [("Solidity", 1)])
+check("notebooks are their own language",
+      pw._detect_languages(["train.ipynb"]), [("Jupyter notebook", 1)])
+check("unknown extensions counted as nothing", pw._detect_languages(["a.xyz"]), [])
+
+print("\n_detect_frameworks — the toolchain names itself, for free")
+check("next.config -> Next.js", pw._detect_frameworks(["next.config.ts"]), ["Next.js"])
+check("matched on basename, at any depth",
+      pw._detect_frameworks(["packages/web/next.config.js"]), ["Next.js"])
+check("hardhat and foundry both reported",
+      pw._detect_frameworks(["hardhat.config.ts", "foundry.toml"]),
+      ["Hardhat", "Foundry"])
+check("reported in signal order, not path order",
+      pw._detect_frameworks(["vite.config.js", "next.config.js"]),
+      ["Next.js", "Vite"])
+check("capped so a monorepo does not list a dozen",
+      len(pw._detect_frameworks([
+          "next.config.js", "nuxt.config.js", "remix.config.js", "gatsby-config.js",
+          "angular.json", "svelte.config.js", "astro.config.mjs", "vite.config.js",
+      ])) <= pw.MAX_FRAMEWORKS, True)
+check("no config files -> nothing claimed", pw._detect_frameworks(["src/a.ts"]), [])
+
+print("\n_detect_dependencies — the manifest is the highest-signal evidence there is")
+PKG_JSON = json.dumps({"dependencies": {
+    "next": "16.2.10", "react": "19.0.0", "wagmi": "2.5.0"}})
+check("package.json read whatever the format",
+      pw._detect_dependencies(PKG_JSON), [("Next.js", "frontend"), ("React", "frontend"),
+                                          ("wagmi", "frontend")])
+check("requirements.txt pins parsed",
+      pw._detect_dependencies("scikit-learn==1.3.0\nnumpy>=1.24\n"),
+      [("scikit-learn", "ml"), ("NumPy", "ml")])
+check("substring match catches the family",
+      pw._detect_dependencies("pytorch-lightning==2.0"), [("PyTorch", "ml")])
+check("scoped packages match",
+      pw._detect_dependencies('"@openzeppelin/contracts": "5.0.0"'),
+      [("OpenZeppelin", "contracts")])
+# react-native is tested before react, or every mobile app detects as a web front
+# end — and the label dedup keeps sklearn and scikit-learn from both appearing.
+check("react-native beats react",
+      pw._detect_dependencies('"react-native": "0.73"')[0][0], "React Native")
+check("deduplicated by label",
+      pw._detect_dependencies("sklearn\nscikit-learn\n"), [("scikit-learn", "ml")])
+check("empty manifest -> nothing", pw._detect_dependencies(""), [])
+
+print("\n_project_kind — what KIND of project, so it is reviewed as one")
+SOL = [("Solidity", 12), ("TypeScript", 4)]
+check("solidity present -> contracts", pw._project_kind(SOL, [], []), "contracts")
+# Contracts outrank the front end around them: the contracts hold the money, and
+# a reviewer who treats them as an implementation detail reviews the wrong thing.
+check("contracts win over a react front end",
+      pw._project_kind(SOL, [("React", "frontend")], ["Vite"]), "contracts")
+# But a front end that merely TALKS to somebody else's deployed contract pulls in
+# ethers and is not a contract project.
+check("ethers alone is not a contract project",
+      pw._project_kind([("TypeScript", 9)], [("ethers.js", "contracts"),
+                                             ("React", "frontend")], []), "frontend")
+check("hardhat config rescues a contracts repo with no .sol counted",
+      pw._project_kind([], [("Hardhat", "contracts")], ["Hardhat"]), "contracts")
+check("torch -> ml", pw._project_kind([("Python", 6)], [("PyTorch", "ml")], []), "ml")
+check("notebooks alone -> ml",
+      pw._project_kind([("Jupyter notebook", 3), ("Python", 1)], [], []), "ml")
+check("react + express -> fullstack",
+      pw._project_kind([("TypeScript", 20)],
+                       [("React", "frontend"), ("Express", "backend")], []), "fullstack")
+check("django alone -> backend",
+      pw._project_kind([("Python", 30)], [("Django", "backend")], []), "backend")
+check("flutter -> mobile", pw._project_kind([("Dart", 9)], [], ["Flutter"]), "mobile")
+check("nothing recognised -> general",
+      pw._project_kind([("C", 4)], [], []), "general")
+# Every label the classifier can return must have a name and guidance, or the
+# prompt silently loses its review criteria for that kind.
+for _kind in ("contracts", "ml", "mobile", "fullstack", "frontend", "backend", "general"):
+    check(f"{_kind} has a name", _kind in pw.KIND_NAMES, True)
+
+print("\n_named_paths — the client already answered the ranking question")
+check("path with an extension",
+      pw._named_paths("the escrow logic lives in contracts/Escrow.sol"),
+      ["contracts/escrow.sol"])
+check("backticks and full stops stripped",
+      pw._named_paths("extend `src/hooks/usePayroll.ts`."), ["src/hooks/usepayroll.ts"])
+check("a bare directory counts", pw._named_paths("everything under contracts/ ships"),
+      ["contracts"])
+check("manifest names recognised", pw._named_paths("pin it in package.json"),
+      ["package.json"])
+check("ordinary prose names nothing", pw._named_paths("build a dashboard that works"), [])
+check("sorted and deduplicated",
+      pw._named_paths("train.py and train.py and model.py"), ["model.py", "train.py"])
+
+print("\n_wants_tests — tests are a deliverable only when asked for")
+check("unit tests requested", pw._wants_tests("must include unit tests"), True)
+check("coverage requested", pw._wants_tests("90% code coverage required"), True)
+check("named runner requested", pw._wants_tests("write pytest cases for the parser"), True)
+check("no mention", pw._wants_tests("build the dashboard and deploy it"), False)
+
+print("\n_find_manifests — where a project states what it is built from")
+MANI = ["README.md", "package.json", "requirements.txt", "src/a.ts"]
+check("most-informative first", pw._find_manifests(MANI),
+      ["package.json", "requirements.txt"])
+check("capped", len(pw._find_manifests(MANI)) <= pw.MAX_MANIFESTS, True)
+check("subdirectory manifest preferred over the root one",
+      pw._find_manifests(["package.json", "Frontend/package.json"], "Frontend"),
+      ["Frontend/package.json"])
+check("root manifest is the fallback under a subpath",
+      pw._find_manifests(["package.json", "contracts/Escrow.sol"], "contracts"),
+      ["package.json"])
+check("shallowest copy wins",
+      pw._find_manifests(["a/b/package.json", "package.json"]), ["package.json"])
+check("none present -> []", pw._find_manifests(["src/a.ts"]), [])
+
+print("\n_find_readme — prose is context, and it is scoped like everything else")
+check("shallowest wins", pw._find_readme(["docs/README.md", "README.md"]), "README.md")
+check("any spelling", pw._find_readme(["docs/readme.rst"]), "docs/readme.rst")
+check("subdirectory README preferred",
+      pw._find_readme(["README.md", "contracts/README.md"], "contracts"),
+      "contracts/README.md")
+check("root README is the fallback under a subpath",
+      pw._find_readme(["README.md", "contracts/Escrow.sol"], "contracts"), "README.md")
+check("no readme -> ''", pw._find_readme(["a.py"]), "")
+
+print("\n_fetch_github_code — inventory first, then context, then implementation")
 
 
-def _run_counting(routes, url="https://github.com/acme/widget"):
+def _tree(*entries):
+    """A GitHub tree response from (path, size) pairs."""
+    return json.dumps({"tree": [
+        {"type": "blob", "path": p, "size": s} for p, s in entries]}).encode()
+
+
+def _run_counting(routes, url="https://github.com/acme/widget", focus=""):
     """Run a fetch and report how many api.github.com requests it made.
 
     The metered surface is the only one that matters: raw is CDN-served and
     unmetered, api.github.com is 60/hr per IP on shared validator egress.
+
+    Returns the evidence dict, or a `RAISED:` string — see `_text`.
     """
     calls = {"api": 0, "raw": 0}
 
@@ -410,278 +608,285 @@ def _run_counting(routes, url="https://github.com/acme/widget"):
 
     pw.gl.nondet.web = types.SimpleNamespace(get=_get)
     try:
-        return pw._fetch_github_code(url), calls
+        return pw._fetch_github_code(url, focus), calls
     except UserError as e:
         return f"RAISED:{e.message}", calls
+
+
+def _text(result):
+    """The evidence text out of whatever `_run_counting` returned."""
+    return result if isinstance(result, str) else result["text"]
 
 
 PY_SRC = b"import sys\n\n\ndef main():\n    print('hi')\n"
 TS_SRC = b"export const a = 1\nexport const b = 2\nexport const c = 3\n"
 
-# Conventional repo: served entirely from raw, ZERO metered API calls. Every
-# raw URL carries the HEAD ref, which GitHub resolves to the default branch —
-# so these routes assert the ref as well as the content.
-code, calls = _run_counting([
+# The ordinary case. The listing is call number one and the only metered call
+# there is: every file below it comes from unmetered raw.
+ev, calls = _run_counting([
+    ("api.github.com", _Resp(200, _tree(
+        ("README.md", 100), ("package.json", 200), ("src/index.ts", 300)))),
     ("/HEAD/README.md", _Resp(200, b"# Widget\nDoes a thing.")),
+    ("/HEAD/package.json", _Resp(200, PKG_JSON.encode())),
     ("/HEAD/src/index.ts", _Resp(200, TS_SRC)),
-    ("/HEAD/main.py", _Resp(200, PY_SRC)),
 ])
+code = _text(ev)
+check("exactly one metered call", calls["api"], 1)
 check("README included", "// FILE: README.md" in code, True)
-check("entrypoint included", "// FILE: src/index.ts" in code, True)
-check("second entrypoint included", "// FILE: main.py" in code, True)
-check("capped at 2 source files", code.count("// FILE:"), 3)
-check("real content reaches the prompt", "print('hi')" in code, True)
+check("manifest included", "// FILE: package.json" in code, True)
+check("source included", "// FILE: src/index.ts" in code, True)
+check("real content reaches the prompt", "export const a = 1" in code, True)
 check("no Response repr leaks in", "Response(" in code, False)
-check("ZERO api.github.com calls on the happy path", calls["api"], 0)
+check("kind detected from the manifest", ev["kind"], "frontend")
 
-# A Python repo must reach app.py despite the JS-first probe order.
-code, calls = _run_counting([
-    ("/HEAD/README.md", _Resp(200, b"# Tool\nA CLI.")),
-    ("/HEAD/app.py", _Resp(200, PY_SRC)),
+# The inventory is what stops an excerpt from reading as a whole repository.
+check("inventory counts the files", "3 files" in ev["inventory"], True)
+check("inventory names the language", "TypeScript" in ev["inventory"], True)
+check("inventory names the dependencies", "React" in ev["inventory"], True)
+check("inventory states the classification",
+      "front-end web application" in ev["inventory"], True)
+check("inventory reports the absence of tests",
+      "No test files found" in ev["inventory"], True)
+# Carried beside the evidence, never prepended to it: the fingerprint is the
+# HEAD of the text, and a paragraph of inventory in front would make every
+# repository with the same stack fingerprint alike — handing away the swap check
+# that is the validator's whole job.
+check("inventory is NOT in the evidence text", "3 files" in code, False)
+check("evidence still leads with a file", code.startswith("// FILE:"), True)
+
+# A small repository is read whole, and says so.
+check("small repo shows everything", "All 1 source files are shown below" in
+      ev["inventory"], True)
+
+# A large one is read wider and shallower, and says THAT.
+BIG_TREE = _tree(*([("README.md", 100)] +
+                   [(f"src/mod{i:03d}/handler.ts", 900) for i in range(140)]))
+ev, calls = _run_counting([
+    ("api.github.com", _Resp(200, BIG_TREE)),
+    ("/HEAD/README.md", _Resp(200, b"# Platform\nA large system.")),
+    ("handler.ts", _Resp(200, TS_SRC)),
 ])
-check("python repo reaches app.py", "// FILE: app.py" in code, True)
-check("python repo needs no API call", calls["api"], 0)
+check("large repo still costs one metered call", calls["api"], 1)
+check("large repo reads the large plan's slot count",
+      _text(ev).count("// FILE:") - 1, pw.PLAN_LARGE["files"])
+check("large repo states it is a sample",
+      "of the 140 source files are shown below" in ev["inventory"], True)
+check("large repo does not claim completeness",
+      "All 140" in ev["inventory"], False)
+check("the rest are said to exist", "were not read" in ev["inventory"], True)
 
-# The default branch is whatever the repo says it is. `main` and `master` were
-# guesses; HEAD is the answer. A repo defaulting to `blead`, `develop` or `trunk`
-# used to be unreachable by raw entirely — no branch name matched, so the branch
-# was never identified and every such repo fell through to the metered listing.
-code, calls = _run_counting([
-    ("/HEAD/README.md", _Resp(200, b"# Legacy\nOld.")),
-    ("/HEAD/main.go", _Resp(200, b"package main\n\nfunc main() {}\n")),
-])
-check("non-main default branch served via HEAD", "// FILE: main.go" in code, True)
-check("non-main default needs no API call", calls["api"], 0)
+print("\n_fetch_github_code — ranking, scoping and the milestone's own words")
+# The client named a file. That outranks every inference — including the much
+# larger file that size-first ranking would have taken instead.
+ev, calls = _run_counting([
+    ("api.github.com", _Resp(200, _tree(
+        ("contracts/Escrow.sol", 400), ("src/huge.ts", 90000)))),
+    ("Escrow.sol", _Resp(200, b"contract Escrow {\n  function lock() {}\n}\n")),
+    ("huge.ts", _Resp(200, TS_SRC)),
+], focus="the escrow logic lives in contracts/Escrow.sol")
+check("a named file is ranked first",
+      _text(ev).index("Escrow.sol") < _text(ev).index("huge.ts"), True)
 
-# An explicit /tree/<branch> URL still pins that branch rather than HEAD — the
-# client linked a specific branch and that is the evidence they submitted.
-code, calls = _run_counting([
-    ("/develop/README.md", _Resp(200, b"# Feature branch")),
-    ("/develop/main.py", _Resp(200, PY_SRC)),
-], url="https://github.com/acme/widget/tree/develop")
-check("pinned branch overrides HEAD", "// FILE: main.py" in code, True)
-check("pinned branch needs no API call", calls["api"], 0)
+# A /tree/<branch>/<dir> URL scopes the whole evaluation to that directory —
+# without it a Solidity milestone was judged on three React pages.
+ev, calls = _run_counting([
+    ("api.github.com", _Resp(200, _tree(
+        ("contracts/Escrow.sol", 400), ("Frontend/src/App.tsx", 9000)))),
+    ("Escrow.sol", _Resp(200, b"contract Escrow {}\n// a\n// b\n")),
+    ("App.tsx", _Resp(200, TS_SRC)),
+], url="https://github.com/acme/mono/tree/main/contracts")
+check("subpath scopes the source", "// FILE: contracts/Escrow.sol" in _text(ev), True)
+check("out-of-scope files excluded", "App.tsx" in _text(ev), False)
+check("scoped repo classified from its own files", ev["kind"], "contracts")
 
-# FIX: a repo whose README is not spelled README.md. The branch used to be
-# identified by whichever name served README.md, so README.rst meant "no branch
-# found" and the whole repo was pushed onto the API path that 403s from
-# validator egress. Now the source is read directly and the missing README costs
-# only its own paragraph.
-code, calls = _run_counting([
-    ("/HEAD/README.rst", _Resp(200, b"Widget\n======\n")),
-    ("/HEAD/main.py", _Resp(200, PY_SRC)),
-])
-check("README.rst repo still yields source", "// FILE: main.py" in code, True)
-check("README.rst repo needs no API call", calls["api"], 0)
+# Tests are excluded by default — they are often the biggest files in a repo and
+# would win slots from the code they test.
+TEST_TREE = _tree(("src/parser.ts", 400), ("tests/parser.test.ts", 8000))
+ROUTES = [("api.github.com", _Resp(200, TEST_TREE)),
+          ("src/parser.ts", _Resp(200, TS_SRC)),
+          ("tests/parser.test.ts", _Resp(200, b"it('works', () => {})\n// a\n// b\n"))]
+ev, _ = _run_counting(ROUTES)
+check("tests excluded by default", "parser.test.ts" in _text(ev), False)
+check("but counted in the inventory", "1 test files present" in ev["inventory"], True)
+# …and fetched when the milestone asks, because judging "must include unit tests"
+# from an excerpt that deliberately excluded tests is the same failure as scoring
+# code_quality off a repository landing page.
+ev, _ = _run_counting(ROUTES, focus="ship the parser with unit tests")
+check("tests fetched when the milestone asks for them",
+      "// FILE: tests/parser.test.ts" in _text(ev), True)
+check("implementation still comes too", "// FILE: src/parser.ts" in _text(ev), True)
 
-# Same for a repo with no README at all: nothing about it blocks source probing.
-code, calls = _run_counting([
-    ("/HEAD/index.js", _Resp(200, b"const a = 1\nconst b = 2\nconst c = 3\n")),
-])
-check("README-less repo still yields source", "// FILE: index.js" in code, True)
-check("README-less repo needs no API call", calls["api"], 0)
+print("\n_fetch_github_code — the gm-striker shape, end to end")
+VITE_README = (b"# React + Vite\n\nThis template provides a minimal setup to get "
+               b"React working in Vite with HMR and some ESLint rules.\n")
+GM_TREE = _tree(
+    ("README.md", 1027), ("src/App.jsx", 1781), ("src/main.jsx", 1465),
+    ("src/components/GMButton.jsx", 4336), ("src/components/StatsCards.jsx", 2547),
+    ("vite.config.js", 161))
+BIG = b"const x = 1\n" * 800          # ~9600 chars, over the small plan's per-file cap
+ev, calls = _run_counting([
+    ("api.github.com", _Resp(200, GM_TREE)),
+    ("/HEAD/README.md", _Resp(200, VITE_README)),
+    ("/HEAD/src/App.jsx", _Resp(200, b"import GMButton from './components/GMButton'\nexport default function App() {}\n// pad\n")),
+    ("/HEAD/src/main.jsx", _Resp(200, b"import App from './App'\nrender(App)\n// pad\n")),
+    ("/HEAD/src/components/GMButton.jsx", _Resp(200, BIG)),
+    ("/HEAD/src/components/StatsCards.jsx", _Resp(200, b"const s = 1\nconst t = 2\nconst u = 3\n")),
+], url="https://github.com/kenil1710/gm-striker")
+code = _text(ev)
 
-# No README and nothing at a guessed entrypoint -> ONE listing call. `main.py`
-# is deliberately left unrouted: it is in RAW_PROBE_PATHS, so serving it would
-# satisfy pass 1 and this fixture would stop exercising the listing at all.
-code, calls = _run_counting([
-    ("api.github.com", _Resp(200, TREE)),
-    ("/HEAD/src/app.ts", _Resp(200, TS_SRC)),
-    ("/HEAD/src/extra.ts", _Resp(200, TS_SRC)),
-])
-check("falls back to the listing", "// FILE: src/app.ts" in code, True)
-check("listing walks past the 404 to the next candidate",
-      "// FILE: src/extra.ts" in code, True)
-check("listing is capped at ONE call", calls["api"], 1)
+# The whole point of the rewrite: the files holding the requirements are present.
+check("component reached", "// FILE: src/components/GMButton.jsx" in code, True)
+check("second component reached", "// FILE: src/components/StatsCards.jsx" in code, True)
+check("entry files still there for context", "// FILE: src/App.jsx" in code, True)
+check("template README excluded", "This template provides" in code, False)
+check("its absence is stated", pw.NO_README_NOTE in code, True)
+# The note must NOT lead: the fingerprint is the head of the evidence, and a
+# fixed 150-char prefix would make every scaffolded repo fingerprint alike.
+check("note does not lead the evidence", code.startswith("// FILE:"), True)
+check("note survives truncation whole", code.endswith(pw.NO_README_NOTE), True)
+check("build config never fetched", "vite.config" in code, False)
+check("vite still reported as the toolchain", "Vite" in ev["inventory"], True)
 
-# The 403 that motivated all of this: unreachable API, but raw still serves.
-code, calls = _run_counting([
-    ("api.github.com", _Resp(403, b"rate limit exceeded")),
-    ("/HEAD/README.md", _Resp(200, b"# Widget\nDoes a thing.")),
-    ("/HEAD/main.py", _Resp(200, PY_SRC)),
-])
-check("API 403 is irrelevant when raw works", "// FILE: main.py" in code, True)
-check("API never even called", calls["api"], 0)
+print("\nheaders carry length, role and truncation")
+check("role labelled", "UI component" in code, True)
+check("entry role labelled", "application entry point" in code, True)
+check("real length reported", "(9600 chars" in code, True)
+# Five source files is a small repository, so the per-file slice is the small
+# plan's — a 9600-char file is cut there, not at some constant.
+check("truncated at the PLAN's per-file cap",
+      f"showing first {pw.PLAN_SMALL['per_file']}" in code, True)
+check("oversized file actually cut",
+      code.count("const x = 1") < 800, True)
+check("total budget respected", len(code) <= pw.PLAN_SMALL["budget"], True)
 
 print("\n_fetch_github_code — a README is not code (job 16)")
-# Django/Rails/Maven/monorepo/cmd-server layouts: a README at the root and no
-# source at any guessed path. The old gate was `not pieces`, so the README alone
-# satisfied it, the listing never ran, and the model was asked to score
-# code_quality having been shown nothing but prose — job 16 scored 0 there and
-# the milestone was rejected at 45 on evidence no validator ever saw.
-DJANGO_TREE = json.dumps({"tree": [
-    {"type": "blob", "path": "README.md", "size": 100},
-    {"type": "blob", "path": "manage.py", "size": 100},
-    {"type": "blob", "path": "shop/views.py", "size": 100},
-]}).encode()
-code, calls = _run_counting([
-    ("api.github.com", _Resp(200, DJANGO_TREE)),
+# Django/Rails/Maven/monorepo layouts: a README at the root and no source at any
+# conventional path. The old design probed by convention, found the README,
+# stopped, and asked the model to score code_quality having been shown nothing
+# but prose — job 16 scored 0 there and was rejected at 45 on evidence no
+# validator ever saw. Reading the listing first makes the shape unreachable.
+ev, calls = _run_counting([
+    ("api.github.com", _Resp(200, _tree(
+        ("README.md", 100), ("manage.py", 100), ("shop/views.py", 100)))),
     ("/HEAD/README.md", _Resp(200, b"# Shop\nA Django storefront.")),
     ("/HEAD/manage.py", _Resp(200, PY_SRC)),
     ("/HEAD/shop/views.py", _Resp(200, PY_SRC)),
 ], url="https://github.com/acme/shop")
-check("README alone no longer suppresses the listing", calls["api"], 1)
-check("unguessed source is reached", "// FILE: manage.py" in code, True)
-check("second unguessed file too", "// FILE: shop/views.py" in code, True)
-# The listing's _find_readme would otherwise re-fetch the same prose and spend
-# the budget on it twice.
+code = _text(ev)
+check("the app's own module is read", "// FILE: shop/views.py" in code, True)
+# manage.py is Django's scaffolding, not the deliverable — CONFIG_FILENAMES drops
+# it — but its presence still names the framework.
+check("scaffolding excluded from the evidence", "// FILE: manage.py" in code, False)
+check("scaffolding still names the framework", "Django" in ev["inventory"], True)
 check("README not duplicated", code.count("// FILE: README.md"), 1)
 
-# The budget bug this created: the README answers, then all eleven probes miss,
-# so the speculative counter is spent by the time the listing runs. Sharing one
-# counter made the walk break on its first iteration and return the README
-# alone — reintroducing the exact failure through the back door.
-DEEP_TREE = json.dumps({"tree": [
-    {"type": "blob", "path": "packages/api/src/server.ts", "size": 100},
-]}).encode()
-code, calls = _run_counting([
-    ("api.github.com", _Resp(200, DEEP_TREE)),
+# A deep monorepo path with nothing at any conventional location.
+ev, _ = _run_counting([
+    ("api.github.com", _Resp(200, _tree(("packages/api/src/server.ts", 100)))),
     ("/HEAD/README.md", _Resp(200, b"# Monorepo\nTurbo workspace.")),
     ("/HEAD/packages/api/src/server.ts", _Resp(200, TS_SRC)),
 ], url="https://github.com/acme/mono")
-check("exhausted probe budget does not starve the listing",
-      "// FILE: packages/api/src/server.ts" in code, True)
+check("deep paths are reached", "// FILE: packages/api/src/server.ts" in _text(ev), True)
 
-# A README plus an unreadable listing must NOT be scored as code. Reverting is
-# retryable; scoring prose as code_quality rejects the milestone permanently.
-_stub_routes([
-    ("api.github.com", _Resp(403, b"rate limited")),
-    ("/HEAD/README.md", _Resp(200, b"# Shop\nA Django storefront.")),
-])
-try:
-    pw._fetch_github_code("https://github.com/acme/shop")
-    fails.append("README + 403 listing should have raised")
-    print("  FAIL README + 403 listing did not raise")
-except UserError as e:
-    assert e.message.startswith("[TRANSIENT]"), e.message
-    print(f"  ok   README + 403 -> {e.message[:34]}")
-
-# Source found on raw means the listing is never consulted, so a rate limit
-# there cannot turn a good submission into a revert.
-code, calls = _run_counting([
-    ("api.github.com", _Resp(403, b"rate limited")),
-    ("/HEAD/README.md", _Resp(200, b"# Widget")),
-    ("/HEAD/main.py", _Resp(200, PY_SRC)),
-])
-check("source on raw keeps the API out of it entirely", calls["api"], 0)
-
+print("\n_fetch_github_code — generated output is not source")
 MINIFIED = b"!function(){" + b"z" * 900 + b"}();"
-
-# An unmarked bundle is only detectable once fetched, so it must be skipped
-# past rather than filling a slot with one unreadable line. Here the bundle sits
-# at a conventional entrypoint, so it is reached through the raw probe path.
-code, calls = _run_counting([
-    ("/HEAD/README.md", _Resp(200, b"# Widget\nDoes a thing.")),
+ev, calls = _run_counting([
+    ("api.github.com", _Resp(200, _tree(("src/index.js", 900), ("main.py", 100)))),
     ("/HEAD/src/index.js", _Resp(200, MINIFIED)),
     ("/HEAD/main.py", _Resp(200, PY_SRC)),
 ], url="https://github.com/acme/bundled")
+code = _text(ev)
 check("bundle excluded from prompt", "// FILE: src/index.js" in code, False)
 check("real source used instead", "// FILE: main.py" in code, True)
 check("no minified payload leaks in", "z" * 100 in code, False)
-check("skipping a bundle costs no API call", calls["api"], 0)
+check("skipping a bundle still costs one metered call", calls["api"], 1)
 
-# Every conventional entrypoint is a bundle, and there is no README, so raw
-# yields nothing and the listing runs. Its candidates are bundles too, except
-# the last — which the probe budget now comfortably reaches.
-TWO_BUNDLES = json.dumps({"tree": [
-    {"type": "blob", "path": "a-bundle.js", "size": 900},
-    {"type": "blob", "path": "b-bundle.js", "size": 900},
-    {"type": "blob", "path": "real.ts", "size": 100},
-]}).encode()
-code, calls = _run_counting([
-    ("api.github.com", _Resp(200, TWO_BUNDLES)),
-    ("bundle.js", _Resp(200, MINIFIED)),
-    ("real.ts", _Resp(200, b"const a = 1\nconst b = 2\nconst c = 3\n")),
-], url="https://github.com/acme/allbundles")
-check("bundles skipped, real source still found", "// FILE: real.ts" in code, True)
-check("no bundle payload in the prompt", "z" * 100 in code, False)
-check("listing still capped at ONE call", calls["api"], 1)
+print("\n_fetch_github_code — ref handling")
+# The default branch is whatever the repo says it is. `main` and `master` were
+# guesses; HEAD is the answer, and the listing uses the same ref as every fetch.
+ev, _ = _run_counting([
+    ("trees/HEAD", _Resp(200, _tree(("main.go", 100)))),
+    ("/HEAD/main.go", _Resp(200, b"package main\n\nfunc main() {}\n")),
+], url="https://github.com/acme/legacy")
+check("listing and fetches share one ref", "// FILE: main.go" in _text(ev), True)
 
-# 403 on the listing is GitHub rate-limiting a validator. It MUST raise, not
-# quietly fall back to rendering the landing page — that mismatch is what makes
-# an honest validator reject an honest leader.
-_stub_routes([("api.github.com", _Resp(403, b"rate limited"))])
-try:
-    pw._fetch_github_code("https://github.com/acme/widget")
-    fails.append("403 on tree should have raised")
-    print("  FAIL 403 on tree did not raise")
-except UserError as e:
-    assert e.message.startswith("[TRANSIENT]"), e.message
-    print(f"  ok   403 listing -> {e.message[:34]}")
+# An explicit /tree/<branch> URL pins that branch instead.
+ev, _ = _run_counting([
+    ("trees/develop", _Resp(200, _tree(("main.py", 100)))),
+    ("/develop/main.py", _Resp(200, PY_SRC)),
+], url="https://github.com/acme/widget/tree/develop")
+check("pinned branch overrides HEAD", "// FILE: main.py" in _text(ev), True)
+
+print("\n_fetch_github_code — fails closed, and says which kind of failure")
+# 403 is GitHub rate-limiting a validator. It MUST raise, not quietly fall back
+# to rendering the landing page — that mismatch is what makes an honest
+# validator reject an honest leader. And it must NOT be retried: the only thing
+# an immediate retry does to a rate limit is deepen it.
+ev, calls = _run_counting([("api.github.com", _Resp(403, b"rate limited"))])
+check("403 listing raises", _text(ev).startswith("RAISED:[TRANSIENT]"), True)
+check("a rate limit is never retried", calls["api"], 1)
+
+# 5xx and a dead connection are blips a retry can actually clear.
+ev, calls = _run_counting([("api.github.com", _Resp(503, b"unavailable"))])
+check("503 raises transient", _text(ev).startswith("RAISED:[TRANSIENT]"), True)
+check("503 is retried", calls["api"], pw.MAX_LISTING_RETRIES + 1)
+ev, calls = _run_counting([("api.github.com", _Resp(0, b""))])
+check("a dead connection is retried", calls["api"], pw.MAX_LISTING_RETRIES + 1)
+check("and still ends transient", _text(ev).startswith("RAISED:[TRANSIENT]"), True)
 
 # 403 partway through, on a file, is the same hazard.
-_stub_routes([
-    ("api.github.com", _Resp(200, TREE)),
-    ("README.md", _Resp(200, b"# Widget")),
+ev, _ = _run_counting([
+    ("api.github.com", _Resp(200, _tree(("main.py", 100)))),
     ("main.py", _Resp(403, b"rate limited")),
 ])
-try:
-    pw._fetch_github_code("https://github.com/acme/widget")
-    fails.append("403 on a file should have raised")
-    print("  FAIL 403 on a file did not raise")
-except UserError as e:
-    assert e.message.startswith("[TRANSIENT]"), e.message
-    print(f"  ok   403 file    -> {e.message[:34]}")
+check("403 on a file raises too", _text(ev).startswith("RAISED:[TRANSIENT]"), True)
 
-_stub_routes([("api.github.com", _Resp(0, b""))])
-try:
-    pw._fetch_github_code("https://github.com/acme/widget")
-    fails.append("network failure should have raised")
-except UserError as e:
-    assert e.message.startswith("[TRANSIENT]"), e.message
-    print(f"  ok   network     -> {e.message[:34]}")
+# 404 is deterministic — every validator sees it, so the messages match exactly
+# and _compare_user_errors counts that as agreement.
+ev, _ = _run_counting([("api.github.com", _Resp(404, b"Not Found"))],
+                      url="https://github.com/acme/private")
+check("404 is external, not transient", _text(ev).startswith("RAISED:[EXTERNAL]"), True)
+# The advice must not name a branch: HEAD resolves whatever the default is, so
+# "check the default branch is main or master" sends the client after a problem
+# they do not have.
+check("no branch guessing in the advice", "master" in _text(ev), False)
 
-# 404 on both branch names is deterministic — every validator sees it, so the
-# messages match exactly and _compare_user_errors counts that as agreement.
-_stub_routes([("api.github.com", _Resp(404, b"Not Found"))])
-try:
-    pw._fetch_github_code("https://github.com/acme/private")
-    fails.append("private repo should have raised")
-except UserError as e:
-    assert e.message.startswith("[EXTERNAL]"), e.message
-    # The advice must no longer name a branch: HEAD resolves whatever the
-    # default is, so "check the default branch is main or master" would send the
-    # client after a problem they do not have.
-    assert "master" not in e.message, e.message
-    print(f"  ok   404 all     -> {e.message[:34]}")
-
-# A pinned branch that does not exist is the one case where naming a branch is
-# the actual diagnosis, and both sides build the identical message from the URL
-# alone — required, since _compare_user_errors matches [EXTERNAL] exactly.
-try:
-    pw._fetch_github_code("https://github.com/acme/widget/tree/nope")
-    fails.append("missing pinned branch should have raised")
-except UserError as e:
-    assert "`nope`" in e.message, e.message
-    print(f"  ok   404 pinned  -> ...{e.message[-30:]}")
-
-# The listing is requested at the same single ref as every raw fetch, so leader
-# and validators walk one tree. A second `trees/<guess>` call cannot happen.
-_stub_routes([
-    ("trees/HEAD", _Resp(200, TREE)),
-    ("main.py", _Resp(200, b"x = 1\ny = 2\nz = 3\n")),
-])
-check("listing uses the same ref as the fetches",
-      "// FILE: main.py" in pw._fetch_github_code("https://github.com/acme/legacy"), True)
+# A pinned branch that does not exist is the one case where naming a branch IS
+# the diagnosis, and both sides build the identical message from the URL alone.
+ev, _ = _run_counting([("api.github.com", _Resp(404, b"Not Found"))],
+                      url="https://github.com/acme/widget/tree/nope")
+check("a missing pinned branch is named", "nope" in _text(ev), True)
 
 # Readable listing, nothing showable in it.
-_stub_routes([
-    ("api.github.com", _Resp(200, json.dumps(
-        {"tree": [{"type": "blob", "path": "Main.java", "size": 10}]}).encode())),
-])
-try:
-    pw._fetch_github_code("https://github.com/acme/javaonly")
-    fails.append("empty result should have raised")
-except UserError as e:
-    assert e.message.startswith("[EXTERNAL]"), e.message
-    print(f"  ok   nothing readable -> {e.message[:29]}")
+ev, _ = _run_counting([("api.github.com", _Resp(200, _tree(("Main.class", 10))))],
+                      url="https://github.com/acme/binary")
+check("nothing readable raises external", _text(ev).startswith("RAISED:[EXTERNAL]"), True)
 
-print("\n_find_readme")
-check("shallowest wins", pw._find_readme(tree), "README.md")
-check("nested readme found",
-      pw._find_readme([{"type": "blob", "path": "docs/readme.rst", "size": 1}]),
-      "docs/readme.rst")
-check("no readme -> ''", pw._find_readme([{"type": "blob", "path": "a.py", "size": 1}]), "")
+# An empty tree is not the same as an unreadable one, and must not be scored.
+ev, _ = _run_counting([("api.github.com", _Resp(200, json.dumps({"tree": []}).encode()))],
+                      url="https://github.com/acme/empty")
+check("an empty repo is rejected clearly", "contains no files" in _text(ev), True)
+
+# Malformed JSON from the API is external, not a crash.
+ev, _ = _run_counting([("api.github.com", _Resp(200, b"<html>nope</html>"))])
+check("unparseable listing raises external",
+      _text(ev).startswith("RAISED:[EXTERNAL]"), True)
+
+# A scaffold README and nothing else readable must still raise. The note is not
+# evidence: returning it alone would be a non-empty code_text holding no code.
+ev, _ = _run_counting([
+    ("api.github.com", _Resp(200, _tree(("README.md", 1027)))),
+    ("/HEAD/README.md", _Resp(200, VITE_README)),
+], url="https://github.com/acme/scaffold")
+check("scaffold README alone raises", _text(ev).startswith("RAISED:[EXTERNAL]"), True)
+
+# A non-GitHub URL must never reach any of this — it returns empty text so the
+# caller renders the page instead, and leader and validators all take that same
+# branch off the URL alone.
+check("non-github short-circuits",
+      pw._fetch_github_code("https://gitlab.com/a/b")["text"], "")
+check("and claims no inventory",
+      pw._fetch_github_code("https://gitlab.com/a/b")["kind"], "")
 
 print("\nevidence fingerprinting")
 check("whitespace collapsed", pw._normalize("a  b\n\tc "), "a b c")
@@ -711,8 +916,11 @@ bad_lo = dict(good); bad_lo["design"] = -1
 check("below 0 rejected", pw._scores_well_formed(bad_lo), False)
 
 print("\n_evidence_matches — the actual trust boundary")
-ev = {"code_fp": "abc page one", "site_fp": "xyz page two", "code_len": 1000, "site_len": 500}
-honest = dict(good); honest.update({"code_fp": "abc page one", "site_fp": "xyz page two", "code_len": 1000, "site_len": 500})
+ev = {"code_fp": "abc page one", "site_fp": "xyz page two", "code_len": 1000,
+      "site_len": 500, "inv_fp": "12 files, 9 of them source", "kind": "contracts"}
+honest = dict(good); honest.update({
+    "code_fp": "abc page one", "site_fp": "xyz page two", "code_len": 1000,
+    "site_len": 500, "inv_fp": "12 files, 9 of them source", "kind": "contracts"})
 check("honest leader accepted", pw._evidence_matches(honest, ev), True)
 
 drifted = dict(honest); drifted["code_len"] = 960
@@ -729,6 +937,17 @@ check("leader scored a much smaller page, REJECTED", pw._evidence_matches(trunca
 
 missing = dict(good)
 check("leader omitted fingerprints entirely, REJECTED", pw._evidence_matches(missing, ev), False)
+
+# The inventory steers the review — how much of the repo the excerpt is, and
+# which criteria the prompt carries — so a leader that reported a different one
+# scored against different instructions, whatever the source text says.
+lied_inventory = dict(honest); lied_inventory["inv_fp"] = "400 files, 380 of them source"
+check("leader misreported the inventory, REJECTED",
+      pw._evidence_matches(lied_inventory, ev), False)
+
+lied_kind = dict(honest); lied_kind["kind"] = "frontend"
+check("leader misreported the project kind, REJECTED",
+      pw._evidence_matches(lied_kind, ev), False)
 
 print("\n_compare_user_errors")
 E = UserError

@@ -18,6 +18,11 @@ class Milestone:
     functionality_score: u32
     completeness_score: u32
     final_score: u32
+    # Appended at the end on purpose: storage layout is positional, so
+    # inserting above would shift every field after it. The model's own account
+    # of what it read — display only, never read back by contract logic and
+    # never part of consensus. See `_extract_scores`.
+    reasoning: str
 
 
 @allow_storage
@@ -175,6 +180,21 @@ ERROR_LLM = "[LLM_ERROR]"  # model misbehaved — never agreement, force rotatio
 # The four scoring axes, in the order they are weighted and stored.
 SCORE_KEYS = ("code", "design", "functionality", "completeness")
 
+REASONING_ALIASES = ("reasoning", "reason", "analysis", "rationale", "explanation")
+"""What the model might call its written justification.
+
+Several spellings because, unlike a score, a miss here is silent — there is no
+weight to notice its absence and no error to raise, so a model answering with
+`rationale` would simply show a blank panel."""
+
+REASONING_CHARS = 1500
+"""Cap on the stored justification.
+
+It goes into contract storage on every verified milestone, so it is bounded
+rather than trusted. Whitespace is collapsed before the cut so the cap measures
+content and not a model's indentation habits. Enough for a line-cited paragraph
+per axis; short of an essay."""
+
 # What the model is asked to call each axis, mapped to our internal key.
 SCORE_ALIASES = {
     "code": ("code_quality", "code", "codeQuality", "quality"),
@@ -298,6 +318,28 @@ def _extract_scores(reply: object, weights: dict) -> dict:
         except Exception:
             raise gl.vm.UserError(f"{ERROR_LLM} Non-numeric score for {key}: {raw}")
 
+    # ── The model's own account of what it read ──
+    #
+    # Carried out of the block for display, and DELIBERATELY not validated: it
+    # is not compared by `_evidence_matches`, not required by
+    # `_scores_well_formed`, and never gates a payout. A missing or malformed
+    # `reasoning` costs a caption, not a milestone — which is the whole reason
+    # it can be surfaced at all. Making consensus depend on free prose would
+    # ask every validator to agree on a paragraph, and prose does not converge
+    # the way four integers do.
+    #
+    # Read strictly as a claim BY the leader, not as a fact about the code. The
+    # trust boundary is unchanged: validators still confirm the leader scored
+    # the evidence they can themselves fetch, and nothing here widens that.
+    # What it buys is falsifiability — citations name files and line numbers
+    # that a reader can open, so a fabricated one is visible as fabricated.
+    reasoning = ""
+    for alias in REASONING_ALIASES:
+        if alias in parsed:
+            reasoning = str(parsed[alias])
+            break
+    scores["reasoning"] = " ".join(reasoning.split())[:REASONING_CHARS]
+
     return scores
 
 
@@ -326,12 +368,38 @@ def _evidence_prompt(
     which is how a human reviewer would do it.
     """
     if code_text:
-        code_section = f"REPOSITORY CONTENT:\n{code_text}"
+        # Said explicitly because it is the difference between "this feature is
+        # missing" and "this feature is not in the excerpt". The evidence is a
+        # ranked sample of a repository, and a model told nothing assumes it is
+        # holding the whole thing: shown an entry file that imports `GMButton`
+        # and no `GMButton.jsx`, it concluded the button did not exist.
+        code_section = (
+            "REPOSITORY CONTENT (an excerpt: the source files ranked most "
+            "relevant to THIS milestone, each with its real length in its "
+            "header — files not shown here still exist in the repository). "
+            "Every line is numbered; cite those numbers:\n"
+            f"{code_text}"
+        )
     else:
         code_section = "REPOSITORY: not submitted for this milestone."
 
     if site_text:
-        site_section = f"DEPLOYED SITE TEXT:\n{site_text}"
+        # The rendering conditions are stated because they are not the
+        # freelancer's doing and must not be scored as defects. Measured on
+        # Studionet with a throwaway probe contract: `web.render(mode="text")`
+        # does execute JavaScript — a client-rendered SPA hydrates and its text
+        # comes back — but it renders as an anonymous visitor. No wallet is
+        # connected and nothing is clicked, so a wallet-gated dApp shows its
+        # connect prompt and its on-chain counters render as placeholders. Read
+        # literally, that page "does not work"; the button and the counters are
+        # in the code and cannot be demonstrated any other way from here.
+        site_section = (
+            "DEPLOYED SITE TEXT (captured by an automated browser: JavaScript "
+            "ran, but as an anonymous visitor with no wallet connected and no "
+            "clicks — a connect prompt or an empty data placeholder is expected "
+            "and is NOT a defect):\n"
+            f"{site_text}"
+        )
     else:
         site_section = "DEPLOYED SITE: not submitted for this milestone."
 
@@ -349,9 +417,14 @@ def _evidence_prompt(
     # Only the axes carrying weight actually affect payment; telling the model
     # which those are keeps it from agonising over scores that get multiplied
     # by zero.
-    applicable = [k for k in SCORE_KEYS if int(weights.get(k, 0)) > 0]
+    # Named as the model is asked to name them (`SCORE_ALIASES[k][0]`), not by
+    # our internal key — this line used to say "code, functionality" while the
+    # criteria below it were headed `code_quality` and `functionality`.
+    applicable = [SCORE_ALIASES[k][0] for k in SCORE_KEYS if int(weights.get(k, 0)) > 0]
 
     return f"""You are reviewing a freelance deliverable against its milestone.
+Your scores release or withhold real money, so judge the work in front of you on
+its merits — neither generously nor defensively.
 
 PROJECT REQUIREMENTS:
 {requirements}
@@ -366,7 +439,6 @@ THIS MILESTONE:
 {image_section}
 
 Score each of these 0-100. Scores that count for this submission: {", ".join(applicable)}.
-Give 0 for any axis with no evidence to judge it on.
 
 - code_quality: does the code address the requirements, is it structured and
   readable, is it free of obvious bugs?
@@ -377,14 +449,54 @@ Give 0 for any axis with no evidence to judge it on.
 - completeness: what fraction of the milestone description is actually
   delivered, versus stubbed or missing?
 
-Calibration — use the full range honestly:
-- 90-100: meets the milestone in full, production quality.
-- 80-89: meets the milestone with minor gaps or rough edges.
-- 70-79: substantially delivered but with real gaps.
-- below 70: key parts of the milestone are missing or broken.
+Work through the evidence BEFORE you score. For each requirement above, find the
+code or page text that implements it — then let the scores follow from what you
+found. Fill in `reasoning` first and the numbers after it.
 
-Respond ONLY with a JSON object, no prose, no code fences:
-{{"code_quality": <int>, "design_match": <int>, "functionality": <int>, "completeness": <int>}}
+Your `reasoning` must be checkable. For each requirement, cite the evidence as
+`path/to/file.ext:LINE` using the numbers shown in the left margin, and name the
+function, contract, component or identifier you found there. A reader will open
+those lines. Write only what you can point at:
+
+- Requirement met: cite the file, the line, and the identifier that implements
+  it — "escrow lock: contracts/Escrow.sol:88 `lockFunds()` transfers via
+  SafeERC20".
+- Requirement not found in the excerpt: say exactly that. "No ReentrancyGuard in
+  the files shown" is a real and useful finding. Do NOT assume an unshown file
+  implements it, and do NOT assume its absence proves it missing — say which.
+- Never cite a file or line that does not appear above. An invented citation is
+  worse than none: it is the one thing here a reader can catch, and it will be
+  read as the whole review being fabricated.
+
+Then, per axis, state in one sentence what the citations add up to before you
+give the number.
+
+Calibration — use the full range honestly:
+- 90-100: meets the milestone in full, production quality. Example: every
+  requirement traceable to real code, components separated cleanly, config in its
+  own modules, no obvious bugs.
+- 80-89: meets the milestone with minor gaps or rough edges. Example: all
+  features implemented and working, but thin error handling, some duplication, or
+  one requirement only partly honoured.
+- 70-79: substantially delivered with real gaps. Example: the main feature works
+  but a named secondary requirement is missing or clearly stubbed.
+- 50-69: a genuine attempt at the milestone that does not deliver it — several
+  requirements missing, or the central feature does not work.
+- 1-49: fragments only. A scaffold with the milestone's features barely started.
+- 0: reserved for NO attempt at that axis whatsoever.
+
+Do not score 0 on an axis where an attempt exists, however flawed — 0 rejects the
+milestone outright and pays nothing. Imperfect work belongs in the bands above.
+Equally, do not award 90+ for a plausible-looking scaffold: name the code that
+earns it.
+
+If an axis is genuinely unjudgeable — no repository was submitted, or the site
+text is empty — score it 0 and say so in `reasoning`. Judge only what is
+present; do not penalise this submission for evidence it was never asked for.
+
+Respond ONLY with a JSON object, no prose, no code fences, in this key order:
+{{"reasoning": "<which file or page text satisfies each requirement, and what is missing>",
+ "code_quality": <int>, "design_match": <int>, "functionality": <int>, "completeness": <int>}}
 """
 
 
@@ -512,16 +624,26 @@ byte-identical content and their fingerprints match."""
 
 SOURCE_EXTENSIONS = (
     # Scripting, server-side, data
-    ".py", ".rb", ".php", ".sh", ".sql",
+    ".py", ".rb", ".php", ".sh", ".sql", ".pl", ".lua", ".r", ".jl",
     # JS/TS and single-file component formats
-    ".ts", ".tsx", ".js", ".jsx", ".vue", ".svelte",
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro",
     # Markup and styles — a front-end milestone may be almost entirely these
-    ".html", ".css",
+    ".html", ".css", ".scss", ".sass", ".less",
     # Compiled and systems languages
-    ".java", ".cs", ".c", ".h", ".cpp", ".hpp", ".go", ".rs",
-    ".swift", ".kt", ".scala", ".dart",
+    ".java", ".cs", ".c", ".h", ".cpp", ".hpp", ".cc", ".go", ".rs",
+    ".swift", ".kt", ".kts", ".scala", ".dart", ".ex", ".exs", ".erl",
+    ".hs", ".clj", ".nim", ".zig", ".m", ".mm",
     # On-chain
-    ".sol",
+    ".sol", ".vy", ".cairo", ".move",
+    # Infrastructure as code — a devops milestone's whole deliverable
+    ".tf",
+    # Notebooks. Fetched as source but NOT handed over raw: a .ipynb is a JSON
+    # document whose outputs can be megabytes of base64 image data, so
+    # `_notebook_source` extracts the code cells and everything else is
+    # discarded. Included because for a data-science or ML deliverable the
+    # notebook frequently IS the deliverable, and a reviewer that cannot open
+    # one scores the project on its requirements.txt.
+    ".ipynb",
 )
 """What counts as reviewable source.
 
@@ -530,51 +652,542 @@ Deliberately broad. A narrow list does not merely miss files — it makes
 and reject the submission outright, so every extension left out is a whole
 category of freelance work the platform silently refuses. The first version of
 this list held eight entries and would have turned away any Java, PHP, Ruby,
-C#, C++, Swift, Kotlin, Vue or Svelte deliverable."""
+C#, C++, Swift, Kotlin, Vue or Svelte deliverable.
 
-MAX_SOURCE_FILES = 2
-"""Ceiling on source-file fetches, so the content budget is README + 2 files.
+This platform is open to anyone, so the list is maintained on the assumption
+that the next submission is in a language nobody here has thought about. When
+in doubt an extension goes IN: the cost of a wrong inclusion is one wasted file
+slot that `_looks_minified` usually catches anyway, and the cost of a wrong
+exclusion is a freelancer being told their repository contains no code."""
 
-Deliberately small. GitHub allows 60 unauthenticated requests per hour per IP,
-and this path is paid by the leader AND by every validator in the set — which
-may share egress. At 3 content fetches plus the listing that is 4 requests per
-evaluation in the common case, so an IP supports roughly a dozen verifications
-an hour. It was 3 files (6 requests worst case), which halved that headroom for
-one extra file the 3000-character budget usually could not fit anyway."""
+LANGUAGE_BY_EXTENSION = (
+    # Ordered, and the FIRST match on a suffix wins, so `.tsx` must precede
+    # `.ts` — otherwise every React component is counted as plain TypeScript
+    # and a front-end project detects as a backend one.
+    (".tsx", "TypeScript"), (".ts", "TypeScript"),
+    (".jsx", "JavaScript"), (".mjs", "JavaScript"), (".cjs", "JavaScript"),
+    (".js", "JavaScript"),
+    (".vue", "Vue"), (".svelte", "Svelte"), (".astro", "Astro"),
+    (".ipynb", "Jupyter notebook"), (".py", "Python"),
+    (".sol", "Solidity"), (".vy", "Vyper"), (".cairo", "Cairo"),
+    (".move", "Move"),
+    (".go", "Go"), (".rs", "Rust"),
+    (".java", "Java"), (".kts", "Kotlin"), (".kt", "Kotlin"),
+    (".scala", "Scala"),
+    (".swift", "Swift"), (".dart", "Dart"),
+    (".rb", "Ruby"), (".php", "PHP"), (".cs", "C#"),
+    (".cpp", "C++"), (".hpp", "C++"), (".cc", "C++"),
+    (".c", "C"), (".h", "C/C++ header"),
+    (".exs", "Elixir"), (".ex", "Elixir"), (".erl", "Erlang"),
+    (".hs", "Haskell"), (".clj", "Clojure"), (".nim", "Nim"),
+    (".zig", "Zig"), (".lua", "Lua"), (".pl", "Perl"),
+    (".r", "R"), (".jl", "Julia"),
+    (".mm", "Objective-C++"), (".m", "Objective-C"),
+    (".scss", "SCSS"), (".sass", "Sass"), (".less", "Less"), (".css", "CSS"),
+    (".html", "HTML"), (".sql", "SQL"), (".sh", "Shell"), (".tf", "Terraform"),
+)
+"""Extension to the language a reader would name it, for the inventory.
 
-MAX_FILE_BYTES = 50000
-"""Skip anything larger. A vendored bundle or a generated client would spend
-the whole character budget on code nobody wrote."""
+The point is not taxonomy — it is that the model is told "31 Solidity files, 4
+TypeScript" before it is shown five of them, so it knows which of the two it is
+reviewing and how much of the whole it is holding."""
 
-CODE_TEXT_CHARS = 3000
-"""Total code budget handed to the prompt. Unchanged from the render path."""
+FRAMEWORK_SIGNALS = (
+    # Matched on a path's BASENAME, in this order, and every match is reported.
+    # These are files whose mere presence names the toolchain — no content
+    # needs fetching, so the whole detection is free once the tree is listed.
+    ("next.config", "Next.js"),
+    ("nuxt.config", "Nuxt"),
+    ("remix.config", "Remix"),
+    ("gatsby-config", "Gatsby"),
+    ("angular.json", "Angular"),
+    ("svelte.config", "SvelteKit"),
+    ("astro.config", "Astro"),
+    ("vite.config", "Vite"),
+    ("tailwind.config", "Tailwind CSS"),
+    ("hardhat.config", "Hardhat"),
+    ("foundry.toml", "Foundry"),
+    ("truffle-config", "Truffle"),
+    ("anchor.toml", "Anchor"),
+    ("manage.py", "Django"),
+    ("pubspec.yaml", "Flutter"),
+    ("dockerfile", "Docker"),
+    ("docker-compose", "Docker Compose"),
+    ("serverless.yml", "Serverless"),
+    ("vercel.json", "Vercel"),
+    ("netlify.toml", "Netlify"),
+    ("terraform.tf", "Terraform"),
+)
+"""Configuration files that name a framework, so the stack is known from paths.
+
+Deliberately structural rather than clever. `next.config.ts` in a repository
+root is not a guess about what the project is — it is the project declaring it,
+and a reviewer told "Next.js" reads `app/page.tsx` as a route rather than as a
+file with an odd name."""
+
+MAX_FRAMEWORKS = 6
+"""How many toolchain labels the inventory reports.
+
+A monorepo trips a dozen of these and a list that long stops being a summary."""
+
+MANIFEST_FILENAMES = (
+    # Ordered most-informative first: only `MAX_MANIFESTS` are fetched, and a
+    # `package.json` says far more about what a project IS than a `Pipfile`.
+    "package.json", "requirements.txt", "pyproject.toml", "cargo.toml",
+    "go.mod", "pom.xml", "build.gradle", "build.gradle.kts", "gemfile",
+    "composer.json", "pubspec.yaml", "package.swift", "mix.exs",
+    "environment.yml", "pipfile", "setup.py", "deno.json",
+)
+"""Dependency manifests, fetched deliberately rather than ranked as source.
+
+A manifest is the only place a repository states what it is BUILT FROM, and
+that is a requirement in its own right — "must use React and ethers.js", "must
+use ReentrancyGuard and SafeERC20" are claims a reviewer can check against
+`package.json` in one line and cannot check from source excerpts at all.
+
+They are excluded from `_rank_source_files` (they are not `SOURCE_EXTENSIONS`)
+precisely so they never compete with implementation for a source slot. They get
+their own small budget instead."""
+
+MANIFEST_CHARS = 1200
+"""Per-manifest slice. A manifest is metadata: enough to read the dependency
+list, not enough to spend the code budget on a lockfile-shaped `package.json`
+with 200 transitive pins."""
+
+MAX_MANIFESTS = 2
+"""Two, so a full-stack repository can show both `package.json` and
+`requirements.txt` and be read as the two-language project it is."""
+
+DEPENDENCY_SIGNALS = (
+    # (token, label, kind). Matched as a SUBSTRING of a manifest token — see
+    # `_manifest_tokens` — so `torch` also catches `pytorch-lightning` and
+    # `@openzeppelin/contracts` catches on `openzeppelin`. Ordered, and every
+    # match is reported; `kind` feeds `_project_kind`.
+    ("openzeppelin", "OpenZeppelin", "contracts"),
+    ("hardhat", "Hardhat", "contracts"),
+    ("foundry", "Foundry", "contracts"),
+    ("solc", "solc", "contracts"),
+    ("ethers", "ethers.js", "contracts"),
+    ("web3", "web3", "contracts"),
+    ("viem", "viem", "contracts"),
+    ("anchor-lang", "Anchor", "contracts"),
+    ("torch", "PyTorch", "ml"),
+    ("tensorflow", "TensorFlow", "ml"),
+    ("keras", "Keras", "ml"),
+    ("scikit-learn", "scikit-learn", "ml"),
+    ("sklearn", "scikit-learn", "ml"),
+    ("xgboost", "XGBoost", "ml"),
+    ("lightgbm", "LightGBM", "ml"),
+    ("transformers", "Transformers", "ml"),
+    ("pandas", "pandas", "ml"),
+    ("numpy", "NumPy", "ml"),
+    ("scipy", "SciPy", "ml"),
+    ("matplotlib", "matplotlib", "ml"),
+    ("seaborn", "seaborn", "ml"),
+    ("jupyter", "Jupyter", "ml"),
+    ("mlflow", "MLflow", "ml"),
+    ("next", "Next.js", "frontend"),
+    ("nuxt", "Nuxt", "frontend"),
+    ("react-native", "React Native", "mobile"),
+    ("react", "React", "frontend"),
+    ("vue", "Vue", "frontend"),
+    ("svelte", "Svelte", "frontend"),
+    ("angular", "Angular", "frontend"),
+    ("solid-js", "SolidJS", "frontend"),
+    ("tailwindcss", "Tailwind CSS", "frontend"),
+    ("wagmi", "wagmi", "frontend"),
+    ("redux", "Redux", "frontend"),
+    ("express", "Express", "backend"),
+    ("fastify", "Fastify", "backend"),
+    ("nestjs", "NestJS", "backend"),
+    ("koa", "Koa", "backend"),
+    ("django", "Django", "backend"),
+    ("flask", "Flask", "backend"),
+    ("fastapi", "FastAPI", "backend"),
+    ("sqlalchemy", "SQLAlchemy", "backend"),
+    ("prisma", "Prisma", "backend"),
+    ("mongoose", "Mongoose", "backend"),
+    ("gin-gonic", "Gin", "backend"),
+    ("actix-web", "Actix", "backend"),
+    ("rails", "Rails", "backend"),
+    ("laravel", "Laravel", "backend"),
+    ("spring-boot", "Spring Boot", "backend"),
+    ("expo", "Expo", "mobile"),
+    ("flutter", "Flutter", "mobile"),
+)
+"""Dependency names that identify what a project is, and what kind of project.
+
+This is the single highest-signal detection in the whole path, and it is nearly
+free: one manifest fetch that was worth making anyway. A repository of `.py`
+files could be a Django API, a CLI tool or a classifier — `torch` and
+`scikit-learn` in `requirements.txt` settle it in a way no amount of path
+inspection can, and the review criteria for those three have almost nothing in
+common.
+
+Ordered so the more specific token is tested first: `react-native` before
+`react` (otherwise every mobile app detects as a web front end), and
+`openzeppelin` before the generic chain libraries."""
+
+MAX_DEPENDENCIES = 8
+"""How many library labels the inventory reports. Enough to characterise the
+stack; short of reprinting the manifest we already showed the model."""
+
+MAX_INVENTORY_LANGUAGES = 5
+"""How many languages the inventory names before the tail stops being
+informative. A repository's sixth language is one `.sh` file."""
+
+KIND_NAMES = {
+    "contracts": "a smart-contract project",
+    "ml": "a machine-learning project",
+    "mobile": "a mobile application",
+    "fullstack": "a full-stack web application",
+    "frontend": "a front-end web application",
+    "backend": "a backend service or API",
+    "general": "general software",
+}
+"""`_project_kind`'s labels as a reviewer would say them.
+
+Kept beside the guidance rather than inlined at the two call sites, so the
+inventory paragraph and the review criteria can never disagree about what the
+project was classified as."""
+
+SIZE_SMALL_MAX = 20
+"""At or below this many source files, the whole repository is readable.
+
+The boundary is about what "complete coverage" means, not about cost: under 20
+files the reviewer can be shown effectively everything, so an absent feature is
+genuinely absent and `completeness` can be judged rather than guessed."""
+
+SIZE_MEDIUM_MAX = 100
+"""Above this, no selection is a sample of the project any more — it is a
+sample of a part of it, and the prompt must say so."""
+
+PLAN_SMALL = {"files": 18, "budget": 24000, "per_file": 6000, "fetches": 24}
+PLAN_MEDIUM = {"files": 12, "budget": 30000, "per_file": 4000, "fetches": 20}
+PLAN_LARGE = {"files": 16, "budget": 36000, "per_file": 2600, "fetches": 24}
+"""How much of a repository to read, chosen from how big it is.
+
+Three shapes, and the trade between them is depth against breadth:
+
+* **Small** (< 20 source files) — 18 slots at 6000 characters. Essentially
+  everything, each file whole. A five-file script or a single contract is read
+  in full, so nothing is scored on an excerpt.
+* **Medium** (20-100) — 12 slots at 4000. Selection starts to matter, so the
+  ranking earns its keep, and the budget rises because there is more genuinely
+  relevant code than a small project has.
+* **Large** (100+) — 16 slots at 2600, on the largest budget. MORE files, each
+  shown SHALLOWER. In a 400-file repository the question stops being "is this
+  function well written" and becomes "does this system contain the pieces the
+  milestone named", and that is answered by breadth: sixteen file heads across
+  the feature directories beat four files read to the end.
+
+`files * per_file` deliberately exceeds `budget` in every plan, so the total
+binds first and large files fill fewer slots than the ceiling suggests.
+
+`fetches` bounds the requests spent reaching those slots, including the ones
+rejected after the fact as generated output. It is separate from the slot count
+because a rejected bundle costs a request and fills nothing."""
+
+
+def _plan_for(source_count: int) -> dict:
+    """The reading plan for a repository of this size.
+
+    Returned as a fresh plain dict rather than one of the module constants:
+    the result crosses into a nondet closure and gets cloudpickled, and a
+    caller mutating a shared constant would change the plan for every later
+    evaluation in the same process.
+    """
+    if source_count <= SIZE_SMALL_MAX:
+        chosen = PLAN_SMALL
+        label = "small"
+    elif source_count <= SIZE_MEDIUM_MAX:
+        chosen = PLAN_MEDIUM
+        label = "medium"
+    else:
+        chosen = PLAN_LARGE
+        label = "large"
+    return {
+        "size": label,
+        "files": int(chosen["files"]),
+        "budget": int(chosen["budget"]),
+        "per_file": int(chosen["per_file"]),
+        "fetches": int(chosen["fetches"]),
+    }
+
+RELEVANCE_MIN_TOKEN = 5
+"""Shortest milestone word allowed to influence ranking.
+
+Four would admit `code`, `with`, `must`, `data` — words in every milestone ever
+written, which match nothing distinctive and dilute the real ones. Five keeps
+`escrow`, `dispute`, `payroll`, `wallet`."""
+
+RELEVANCE_STOPWORDS = (
+    "about", "above", "after", "again", "against", "their", "there", "these",
+    "those", "through", "using", "which", "while", "with", "within", "would",
+    "should", "must", "shall", "where", "when", "that", "this", "then",
+    "public", "private", "build", "built", "building", "create", "created",
+    "working", "works", "work", "including", "include", "includes", "included",
+    "required", "require", "requires", "requirement", "requirements",
+    "milestone", "project", "source", "repository", "repo", "github",
+    "deployed", "deploy", "deployment", "complete", "completed", "features",
+    "feature", "functional", "functionality", "system", "support", "supports",
+)
+"""Words common to every milestone description, so matching them ranks nothing.
+
+Sorted-list membership rather than a set: see `_milestone_tokens` on why no
+string set may influence this path."""
+
+RELEVANCE_EXTENSION_HINTS = (
+    (("solidity", "smart contract", "smart-contract", "erc20", "erc-20",
+      "reentrancy", "on-chain", "onchain"), (".sol",)),
+    (("frontend", "front-end", "dashboard", "react", "next.js", "nextjs",
+      "ui ", "user interface"), (".jsx", ".tsx", ".vue", ".svelte")),
+    (("backend", "back-end", "api ", "server", "endpoint"),
+     (".go", ".rs", ".java", ".rb", ".php", ".cs")),
+)
+"""Milestone vocabulary mapped to the extensions that answer it.
+
+Ordered, and the FIRST match wins — a milestone reading "smart contracts …
+source in a public GitHub repo" is about Solidity, and accumulating every hint
+it brushes against would flatten that back into no preference at all.
+
+The trailing spaces in `"ui "` and `"api "` are load-bearing: without them
+`"build"` matches `ui` and every milestone prefers front-end files."""
+
+RELEVANCE_EXTENSION_WEIGHT = 3
+"""What a language match is worth against path-token hits.
+
+Above `RELEVANCE_TOKEN_CAP` on purpose. A Solidity milestone should rank a
+`.sol` file the milestone never names above a `.jsx` file that happens to be
+called `DisputeModal` — the language is the stronger statement of subject."""
+
+RELEVANCE_TOKEN_CAP = 2
+"""Most path-token hits one file may bank.
+
+Uncapped, a deeply nested path accumulates hits for every segment and a long
+requirements block turns into a directory-depth contest."""
+
+MAX_FILE_BYTES = 120000
+"""Skip anything larger before a request is spent on it.
+
+Raised from 50000, which was excluding real deliverables rather than bundles: a
+mature Solidity system, a Django `models.py` or a generated-then-hand-edited API
+client all run past 50KB, and being dropped from candidacy meant the one file
+the milestone was about never reached the reviewer. Per-file character caps
+already stop a large file from eating the budget — this ceiling exists only to
+avoid spending a request downloading a megabyte to throw away.
+
+`_looks_minified` still rejects vendored bundles after the fetch, which is the
+only way to catch the ones that are not named `.min.js`."""
+
+CODE_TEXT_CHARS = 36000
+"""The ceiling any plan may spend, and the budget for the non-GitHub path.
+
+Per-repository budgets come from `_plan_for` — this is the maximum of those,
+used directly only when the code URL is a forge this contract cannot list
+(GitLab, Bitbucket, self-hosted) and the page is rendered instead.
+
+3000 originally, from the old page-render path and unrelated to what a model can
+read; then 8000, which was still under a tenth of a real deliverable. Measured on
+`cronpay-code/cronpay`: 8000 characters bought 4.7% of four files and 0% of the
+277KB of Solidity the milestone was actually about."""
+
+LINE_NUMBER_WIDTH = 4
+"""Column width for the line numbers prefixed to every evidence line.
+
+Evidence is numbered so the model's citations can be CHECKED. Asking for line
+numbers without supplying them does not produce rigour, it produces confident
+fabrication — a reviewer reading "ReentrancyGuard at L142" cannot tell an
+observation from an invention unless L142 was in front of the model.
+
+Numbering costs roughly `LINE_NUMBER_WIDTH + 2` characters per line, about 15%
+of the budget at typical line lengths. That is the price of citations that can
+be falsified, and it is why the budget rose to 20000 in the same change."""
 
 README_CHARS = 800
 """The README states intent, so it earns a slice of the budget — but only a
 slice. Letting prose crowd out source is exactly how the old path failed."""
 
-README_PATH = "README.md"
-"""The one README name probed speculatively, for context only.
+TEMPLATE_README_MARKERS = (
+    "this template provides",
+    "npm create vite",
+    "npx create-next-app",
+    "create react app",
+    "getting started with create react app",
+    "bootstrapped with [create next app]",
+    # Heading forms only for the generic stack names. A real README saying
+    # "built with React + Vite" in a tech-stack line is describing the project;
+    # a README whose FIRST HEADING is that name is the scaffold's own.
+    "# react + vite",
+    "# react + ts",
+    "# vue 3 + vite",
+    "# svelte + vite",
+    "# nuxt 3 minimal starter",
+)
+"""Signatures of a README nobody wrote, matched lowercased against the head.
 
-Nothing hinges on finding it any more — the ref is resolved by `HEAD` and the
-source probes below run whether or not it answered. So a miss costs a paragraph
-of intent, not the evaluation: a `README.rst` repository still gets its source
-files read, and if no source is found at all the listing pass locates any
-`readme*` by name via `_find_readme`. Probing further spellings here would spend
-a sequential CDN round trip per spelling on every repository that has none, to
-recover prose that is explicitly capped at a quarter of the budget."""
+`gm-striker`'s README is `npm create vite`'s verbatim: "# React + Vite / This
+template provides a minimal setup…", through to "## Expanding the ESLint
+configuration". It is 1027 bytes of prose about Oxc and SWC, and it was the
+first 800 characters the model read — a quarter of the whole evidence budget
+spent telling the reviewer about a build tool.
+
+Skipping it is not hiding a defect. The requirement it fails ("a README
+explaining what the project does") is judged from the absence of one, and the
+model is told explicitly that no project README was found. What changes is that
+the 800 characters go to source instead of to boilerplate."""
+
+NO_README_NOTE = (
+    "// NOTE: this repository has no project README — the only README present is "
+    "unmodified framework scaffolding, so it was excluded from the evidence above."
+)
+"""Stated rather than left as silence, so "no README" reads as a finding about
+the repository instead of as a gap in the evidence — the model is asked to judge
+documentation and must know which it is looking at.
+
+Placed at the END of the evidence, and that position is load-bearing. The
+evidence fingerprint is the first `EVIDENCE_FINGERPRINT_CHARS` of the normalised
+text, so leading with 150 characters of fixed prose would make the fingerprint
+nearly identical for every repository that has a template README — and the check
+that catches a leader swapping in a different repository is exactly that
+comparison. A constant prefix hands that away. Trailing it keeps the fingerprint
+covering real source.
+
+Its length is reserved out of the budget up front (see `_fetch_github_code`),
+because appending to a budget already spent would let the final truncation cut
+the note off and silently restore the old silence."""
+
+TEMPLATE_README_SCAN_CHARS = 400
+"""How much of the README the markers are tested against.
+
+The head only, deliberately. Scaffold READMEs lead with their signature, while a
+genuine README that happens to mention Create React App halfway down — in a
+migration note, or crediting where the setup came from — is still somebody's
+real documentation and must not be discarded for it."""
 
 SKIP_DIRS = (
-    "node_modules", "dist", "build", "vendor", "target", "out",
-    "coverage", ".git", "__pycache__", ".next", "venv", ".venv",
+    # Dependencies, vendored or installed
+    "node_modules", "vendor", "bower_components", "pods",
+    "venv", ".venv", "virtualenv", "site-packages",
+    ".bundle", ".gradle", ".cargo", "carthage",
+    # Build and compile output
+    "dist", "build", "target", "out", "obj",
+    ".next", ".nuxt", ".svelte-kit", ".output", ".turbo", ".parcel-cache",
+    ".angular", ".astro", ".docusaurus", "storybook-static",
+    "deriveddata", ".dart_tool",
+    # Generated code and chain artefacts
+    "artifacts", "typechain", "typechain-types", "generated", "codegen",
+    "migrations", ".cache", "forge-cache",
+    # Tooling caches and reports
+    "coverage", "htmlcov", ".git", "__pycache__", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".tox", ".nyc_output", ".idea",
+    ".vscode", ".github",
+    # ML run output
+    "checkpoints", "wandb", "mlruns", ".ipynb_checkpoints",
 )
 """Matched per path SEGMENT, never as a substring — a bare `in` test would
-also drop `webbuild/app.ts`, which is somebody's actual source."""
+also drop `webbuild/app.ts`, which is somebody's actual source.
+
+Grown from twelve entries to cover the shapes this platform now has to accept
+from strangers. The originals were a JavaScript reviewer's list; a Python
+project buries its source under `.venv`, a Solidity project under `artifacts`
+and `typechain-types`, an iOS project under `Pods` and `DerivedData`. Every one
+of those directories outweighs the hand-written source around it, so under a
+size-first ranking they take every slot and the reviewer is shown generated
+output.
+
+Three names were deliberately CONSIDERED and LEFT OUT, because a segment match
+is a blunt instrument and each of them names real source at least as often as
+it names junk:
+
+* `packages` — the source root of every pnpm/Lerna/Turborepo monorepo. Skipping
+  it would delete the entire project on exactly the repository shape this
+  change exists to support.
+* `data` / `datasets` — `src/data/loader.py` is core ML code. The actual
+  datasets are `.csv` and `.pkl`, which are not `SOURCE_EXTENSIONS` and are
+  already excluded by extension, so nothing is gained by the directory rule and
+  a whole layer is lost to it.
+* `bin` — build output for .NET, but the hand-written CLI entry point for a
+  published npm package.
+
+`migrations` is the one judgement call kept. Framework migrations are generated
+and enormous; a hand-written data migration occasionally is not. Dropping them
+costs a rare file and saves a common flood, and a milestone that is genuinely
+about a migration will name it — `_named_paths` restores anything the
+requirements point at by name, ahead of every other signal."""
 
 SKIP_FILENAMES = (
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock",
     "poetry.lock", "go.sum", "composer.lock",
 )
+
+SKIP_NAME_MARKERS = (
+    # Type declarations carry no implementation to review.
+    ".d.ts",
+    # Machine-generated: protobuf stubs, codegen output, Dart build artefacts.
+    ".pb.", "_pb2.", "_pb2_grpc.", ".g.dart", ".freezed.dart", ".generated.",
+    ".designer.", ".min.",
+)
+"""Filename substrings that disqualify a file before a request is spent on it.
+
+Test markers used to live here, which made "exclude tests" and "exclude
+generated code" the same irreversible decision. They are separate concerns:
+generated code is never worth reading, while tests are worth reading exactly
+when the milestone asked for them — see `TEST_NAME_MARKERS`."""
+
+TEST_NAME_MARKERS = (
+    ".test.", ".spec.", "_test.", "test_", ".t.sol",
+)
+"""Filename substrings that mark a file as a test rather than the deliverable.
+
+Split out of `SKIP_NAME_MARKERS` so pass 4 can go and FETCH these when the
+milestone asks for tests, instead of the exclusion being permanent. `.t.sol` is
+Foundry's convention and would otherwise read as ordinary Solidity."""
+
+SKIP_TEST_DIRS = (
+    "test", "tests", "__tests__", "spec", "specs", "e2e", "cypress",
+    "playwright", "fixtures", "mocks", "__mocks__", "testdata",
+)
+"""Matched per path SEGMENT, like `SKIP_DIRS`."""
+
+CONFIG_FILENAMES = (
+    "vite.config", "next.config", "tailwind.config", "postcss.config",
+    "eslint.config", "webpack.config", "rollup.config", "babel.config",
+    "jest.config", "vitest.config", "metro.config", "svelte.config",
+    "nuxt.config", "astro.config", "tsup.config", "commitlint.config",
+    "manage.py", "setup.py", "conftest.py", "gatsby-config",
+)
+"""Build-tool configuration, skipped by FILENAME STEM — never by directory.
+
+This distinction is load-bearing. `src/config/chain.js`, `contract.js` and
+`wagmi.js` are the evidence for a requirement that says in as many words "chain
+and contract config kept in separate modules". A rule that dropped anything
+under a `config/` directory would delete exactly the files the milestone asks
+about, while leaving `vite.config.js` — which nobody wrote — in the running."""
+
+FEATURE_DIRS = (
+    "components", "component", "pages", "page", "views", "screens",
+    "features", "containers", "widgets", "hooks", "controllers",
+    "handlers", "services", "models", "routes", "middleware", "store",
+)
+"""Directory names that hold the code a milestone is actually about.
+
+Files under one of these outrank everything else. The reasoning is empirical:
+`src/App.jsx` and `src/main.jsx` are wrappers — an import list and a provider
+tree — and they are precisely what a conventional-path probe finds first. The
+requirements ("a GM button that connects a wallet and sends the on-chain
+transaction", "stats cards showing counts read from the contract") are
+implemented one directory down, in `src/components/GMButton.jsx` and
+`StatsCards.jsx`, neither of which the old ranking would ever reach."""
+
+ENTRY_FILENAMES = (
+    "app", "main", "index", "_app", "server", "mod", "lib",
+)
+"""Filename stems that are conventionally wrappers, ranked LAST.
+
+Not excluded: in a repository with nothing else they are the only source there
+is. Ranked below real modules so they lose the slot whenever something with
+implementation in it is available."""
 
 MAX_SOURCE_LINE_CHARS = 500
 """A line longer than this is minifier output, not something a person typed."""
@@ -582,54 +1195,75 @@ MAX_SOURCE_LINE_CHARS = 500
 MIN_SOURCE_LINES = 3
 """Fewer lines than this and there is nothing to review."""
 
-RAW_PROBE_PATHS = (
-    "src/App.jsx", "src/App.tsx", "src/main.jsx", "src/main.tsx",
-    "src/index.ts", "src/index.js", "src/main.rs",
-    "main.py", "app.py", "index.js", "main.go",
+TEST_MARKERS = (
+    "unit test", "unit-test", "integration test", "end-to-end test",
+    "e2e test", "test suite", "test coverage", "test case", "tests for",
+    "write tests", "automated test", "testing", "pytest", "jest", "vitest",
+    "mocha", "chai", "forge test", "hardhat test", "junit", "rspec",
+    "code coverage", "100% coverage",
 )
-"""Where an entrypoint conventionally lives, tried in order.
+"""Milestone vocabulary that makes test files part of the deliverable.
 
-Guessing beats asking. `api.github.com` meters at 60 requests per hour per IP
-and validator nodes share busy egress addresses, so the listing call returns
-403 on the nodes that matter even when it succeeds from a developer's laptop.
-`raw.githubusercontent.com` is served from the CDN and carries no such limit,
-so a handful of speculative 404s against raw costs nothing that a single
-metered API call does not cost more."""
+Tests are skipped from source ranking by default and that is right — they
+describe the code rather than being it, and a test file is often the largest
+thing in a repository, so under a size-first ranking they would win every slot.
 
-MAX_RAW_PROBES = 12
-"""Ceiling on the speculative raw requests, counting the misses.
+But "must include unit tests with 90% coverage" is a requirement like any
+other, and judging it from the absence of test files in an excerpt that
+deliberately excluded them is the same failure as scoring `code_quality` off a
+repository landing page. When the milestone asks, pass 4 goes and gets them."""
 
-Raw is unmetered, so this bounds latency rather than quota: each probe is a
-sequential round trip inside the leader's budget, and a CDN hit is tens of
-milliseconds against a verification that already pays for two screenshots and
-an LLM call and is measured in minutes. Twelve cheap misses are cheaper than one
-screenshot, which is why the ceiling is not lower.
+MAX_TEST_FILES = 3
+"""Slots reserved for tests when the milestone asks for them.
 
-Sized to clear one README probe plus every entry in `RAW_PROBE_PATHS` exactly,
-which is load-bearing rather than slack. `RAW_PROBE_PATHS` is ordered JS-first,
-so a lower ceiling does not degrade gracefully — it spends the whole budget
-missing on React paths and never reaches `main.py`, and every Python, Go and
-Rust repository silently scores as though it contained no code. A cap that
-truncates the probe list is worse than no cap at all.
+Enough to show that tests exist, what they cover and how they are written;
+short of letting a thorough suite crowd out the implementation it tests. The
+inventory reports the true count, so three files plus "27 test files present"
+answers "did they write tests" better than seven files would."""
 
-Resolving the ref through `HEAD` rather than guessing `main` then `master` is
-what freed the probe this used to spend on a second README attempt."""
+NAMED_PATH_WEIGHT = 8
+"""What an explicit mention in the requirements is worth.
 
-MAX_LISTING_FETCHES = 6
-"""Ceiling on the file fetches made while walking a listing, counted separately
-from `MAX_RAW_PROBES`.
+Above every other signal combined, and that is the point. If the client wrote
+"the escrow logic lives in contracts/Escrow.sol", no heuristic about feature
+directories or file size should be able to outvote them — they have told us
+exactly which file the milestone is about. This is the one ranking input that
+is not an inference."""
 
-The two budgets measure different things and must not share a counter. A raw
-probe is a guess that is *expected* to miss; a listing walk fetches paths GitHub
-has confirmed exist, and only overspends when the shallowest ones turn out to be
-unmarked bundles that `_looks_minified` rejects after the fetch.
+NAMED_PATH_EXTENSIONS = (
+    ".json", ".toml", ".txt", ".md", ".yml", ".yaml", ".lock", ".cfg", ".ini",
+)
+"""Non-source extensions that still make a token a filename.
 
-Sharing one counter was a live bug the moment the listing stopped being reachable
-only from a standing start: a repository whose README answered and whose eleven
-probes all missed arrived at the listing with the budget already exhausted, so
-the walk broke on its first iteration and the model was handed the README alone
-— the precise outcome the listing exists to prevent. Six clears four bundles and
-still funds both source slots."""
+`_named_paths` needs to recognise `package.json` or `hardhat.config.ts` in a
+requirements sentence as a FILE REFERENCE, even though neither is a file this
+path would ever rank as source. Recognising them costs nothing and missing them
+means "must be configured in hardhat.config.ts" reads as three ordinary words."""
+
+MAX_LISTING_RETRIES = 2
+"""Extra attempts at the ONE metered listing call, beyond the first.
+
+There is no sleep in this sandbox — `time` is not available and a busy-wait
+would burn the leader's budget — so "backoff" here means "try again on the
+failures a retry can actually fix, and never on the ones it makes worse":
+
+* **status 0** (connection never completed) and **5xx** are retried. These are
+  blips; a second attempt commonly succeeds and costs one request.
+* **403 and 429 are NOT retried.** They are GitHub's rate limit, and the only
+  thing an immediate retry does to a rate limit is deepen it — three attempts
+  spend three times the quota to be refused three times, on shared validator
+  egress where that quota is the scarce resource in the first place.
+
+So a quota refusal raises `[TRANSIENT]` on the first response and the caller
+retries the whole verification later, when the window has actually moved."""
+
+MAX_TREE_ENTRIES = 40000
+"""Ceiling on tree entries walked when ranking.
+
+GitHub truncates its own recursive listing at roughly 100k entries; this cuts
+lower so that a monorepo with a checked-in dependency tree cannot turn the rank
+into the most expensive part of the evaluation. Entries arrive in a stable
+server-side order, so leader and validators walk the same prefix."""
 
 
 def _parse_github_repo(url: str) -> dict:
@@ -676,17 +1310,71 @@ def _parse_github_repo(url: str) -> dict:
     if not owner or not repo:
         return {}
 
-    # `/tree/<branch>` pins the branch explicitly. Anything deeper is a path
-    # inside it, which is ignored — the tree call walks the whole repo anyway.
+    # `/tree/<branch>` pins the branch, and anything deeper is a directory
+    # inside it that the client linked ON PURPOSE — it is the milestone's
+    # subject, not decoration.
+    #
+    # That subpath used to be discarded on the reasoning that "the tree call
+    # walks the whole repo anyway", which is true and is exactly the bug: all
+    # three CronPay milestones pointed at different directories
+    # (`/tree/main/contracts`, `/tree/main/Frontend`, the bare root) and every
+    # one of them was handed the identical four files, because the whole-repo
+    # walk ranked the same three largest frontend files first every time. The
+    # contracts milestone — 40 Solidity files, 277KB, judged on
+    # "ReentrancyGuard and SafeERC20" — was scored 78 and paid out having
+    # never been shown a line of Solidity.
     branch = ""
+    subpath = ""
     if len(parts) >= 4 and parts[2] == "tree":
         branch = parts[3]
+        # Normalised without leading or trailing slashes so it can be
+        # concatenated and prefix-matched without either side guessing.
+        subpath = "/".join(parts[4:])
 
-    return {"owner": owner, "repo": repo, "branch": branch}
+    return {"owner": owner, "repo": repo, "branch": branch, "subpath": subpath}
 
 
-def _is_source_path(path: str) -> bool:
-    """Whether a tree entry is source worth showing the model."""
+def _is_template_readme(text: str) -> bool:
+    """Whether a README is the scaffold's rather than the project's.
+
+    Whitespace is collapsed before matching so a marker split across a line
+    break — "# React + Vite\\n\\nThis template provides…" — still reads as one
+    phrase. Matched against the head only; see `TEMPLATE_README_SCAN_CHARS`.
+    """
+    head = " ".join(str(text)[:TEMPLATE_README_SCAN_CHARS].split()).lower()
+    for marker in TEMPLATE_README_MARKERS:
+        if marker in head:
+            return True
+    return False
+
+
+def _is_test_path(path: str) -> bool:
+    """Whether a path is a test rather than the thing being tested.
+
+    Both conventions, because projects use one or the other and rarely both: a
+    directory called `tests/`, or a filename carrying `.test.` / `_test.`.
+    """
+    lowered = path.lower()
+    segments = lowered.split("/")
+    name = segments[-1]
+    for marker in TEST_NAME_MARKERS:
+        if marker in name:
+            return True
+    for directory in segments[:-1]:
+        if directory in SKIP_TEST_DIRS:
+            return True
+    return False
+
+
+def _is_readable_path(path: str) -> bool:
+    """Whether a tree entry is a file worth spending a request on at all.
+
+    Everything `_is_source_path` and `_is_test_source_path` share: a source
+    extension, nothing generated, nothing vendored. The test question is asked
+    separately by each of them, which is the whole reason this is factored out
+    — one predicate answering two different questions is how tests came to be
+    unreachable even when the milestone asked for them.
+    """
     lowered = path.lower()
     if not lowered.endswith(SOURCE_EXTENSIONS):
         return False
@@ -695,15 +1383,476 @@ def _is_source_path(path: str) -> bool:
     name = segments[-1]
     if name in SKIP_FILENAMES:
         return False
-    # `.min.` catches site.min.css and app.min.js before a request is spent on
-    # them. Bundles without the marker are caught by `_looks_minified` after
-    # the fetch, which is the only way to know.
-    if ".min." in name:
-        return False
+    for marker in SKIP_NAME_MARKERS:
+        if marker in name:
+            return False
+    # Config is matched on the stem, so `vite.config.ts` and `vite.config.mjs`
+    # both go without also catching `src/config/chain.js` — see
+    # `CONFIG_FILENAMES`.
+    for stem in CONFIG_FILENAMES:
+        if name == stem or name.startswith(stem + "."):
+            return False
     for directory in segments[:-1]:
         if directory in SKIP_DIRS:
             return False
     return True
+
+
+def _is_source_path(path: str) -> bool:
+    """Whether a tree entry is implementation worth showing the model."""
+    return _is_readable_path(path) and not _is_test_path(path)
+
+
+def _is_test_source_path(path: str) -> bool:
+    """Whether a tree entry is a test worth showing, when tests were asked for."""
+    return _is_readable_path(path) and _is_test_path(path)
+
+
+def _named_paths(text: str) -> list:
+    """File and directory names the requirements point at BY NAME.
+
+    A client who writes "the escrow logic lives in `contracts/Escrow.sol`" or
+    "extend `src/hooks/usePayroll.ts`" has answered the ranking question
+    outright, and no heuristic should be allowed to overrule them. This pulls
+    those references out so `_relevance` can weight them above everything else.
+
+    Two shapes are recognised, both conservative:
+
+    * a token containing a dot whose suffix is a known source or metadata
+      extension — `Escrow.sol`, `package.json`, `train.py`;
+    * a token containing a slash — `contracts/`, `src/hooks/usePayroll.ts` —
+      which is a path however it ends.
+
+    Punctuation around the token is stripped, so backticks, quotes, commas and
+    a trailing full stop do not prevent a match. Returned SORTED and
+    de-duplicated: like `_milestone_tokens`, anything reaching the ranking key
+    must be identically ordered on every node.
+    """
+    lowered = ""
+    for char in str(text).lower():
+        lowered += char if (char.isalnum() or char in "./_-") else " "
+
+    found = []
+    for raw in lowered.split():
+        token = raw.strip("./-_")
+        if not token or len(token) < 3:
+            continue
+
+        # Tested against the UNSTRIPPED token: "everything under contracts/"
+        # is a directory reference, and stripping the trailing slash first is
+        # what made it read as an ordinary word.
+        has_slash = "/" in raw
+        has_extension = False
+        if "." in token:
+            suffix = "." + token.rsplit(".", 1)[1]
+            if suffix in SOURCE_EXTENSIONS or suffix in NAMED_PATH_EXTENSIONS:
+                has_extension = True
+
+        if not has_slash and not has_extension:
+            continue
+        if token not in found:
+            found.append(token)
+
+    found.sort()
+    return found
+
+
+def _wants_tests(text: str) -> bool:
+    """Whether the milestone asks for tests, so pass 4 should go and get them."""
+    lowered = " ".join(str(text).lower().split())
+    for marker in TEST_MARKERS:
+        if marker in lowered:
+            return True
+    return False
+
+
+def _manifest_tokens(text: str) -> list:
+    """Package names out of a manifest, whatever format it is written in.
+
+    Everything that is not a name character becomes a space, which reduces
+    `"next": "16.2.10",` and `scikit-learn==1.3.0` and `torch>=2.0` to the same
+    shape without needing to know whether the file was JSON, TOML or a
+    requirements list. Version numbers survive as separate tokens and match
+    nothing.
+
+    Sorted, for the same determinism reason as everywhere else on this path.
+    """
+    cleaned = ""
+    for char in str(text).lower():
+        cleaned += char if (char.isalnum() or char in "-_./@") else " "
+
+    tokens = []
+    for token in cleaned.split():
+        stripped = token.strip("./-_")
+        if stripped and stripped not in tokens:
+            tokens.append(stripped)
+    tokens.sort()
+    return tokens
+
+
+def _detect_dependencies(manifest_text: str) -> list:
+    """Recognised libraries in a manifest, as `[(label, kind), ...]`.
+
+    Ordered by `DEPENDENCY_SIGNALS`, not by appearance in the file, so two
+    nodes reading the same manifest report the same list in the same order.
+    De-duplicated by LABEL, so `sklearn` and `scikit-learn` do not both appear.
+    """
+    tokens = _manifest_tokens(manifest_text)
+
+    found = []
+    labels = []
+    for marker, label, kind in DEPENDENCY_SIGNALS:
+        if label in labels:
+            continue
+        for token in tokens:
+            if marker in token:
+                found.append((label, kind))
+                labels.append(label)
+                break
+    return found
+
+
+def _detect_languages(paths: list) -> list:
+    """Language histogram over a file list, as `[(language, count), ...]`.
+
+    Sorted by count descending then by name, so ties resolve identically
+    everywhere. Counted over the paths that survived the skip rules, which is
+    the honest denominator: a repository is not "90% JavaScript" because
+    `node_modules` is.
+    """
+    names = []
+    counts = []
+    for path in paths:
+        lowered = str(path).lower()
+        for extension, language in LANGUAGE_BY_EXTENSION:
+            if lowered.endswith(extension):
+                if language in names:
+                    counts[names.index(language)] += 1
+                else:
+                    names.append(language)
+                    counts.append(1)
+                break
+
+    pairs = []
+    for index in range(len(names)):
+        pairs.append((-counts[index], names[index]))
+    pairs.sort()
+
+    ranked = []
+    for negative_count, language in pairs:
+        ranked.append((language, -negative_count))
+    return ranked
+
+
+def _detect_frameworks(paths: list) -> list:
+    """Toolchain labels implied by configuration files present in the tree.
+
+    Free: it reads the listing this function was given and makes no request.
+    """
+    found = []
+    for marker, label in FRAMEWORK_SIGNALS:
+        if label in found:
+            continue
+        for path in paths:
+            name = str(path).lower().split("/")[-1]
+            if name.startswith(marker) or name == marker:
+                found.append(label)
+                break
+        if len(found) >= MAX_FRAMEWORKS:
+            break
+    return found
+
+
+def _project_kind(languages: list, dependencies: list, framework_labels: list) -> str:
+    """What KIND of project this is, which decides how it should be reviewed.
+
+    Returned as one of a fixed set of labels; `_kind_guidance` turns it into
+    the review criteria the prompt carries. Rules are evaluated in a fixed
+    order over already-sorted inputs, so it is deterministic.
+
+    The order encodes which signal is the stronger statement of subject. A
+    repository with Solidity in it and React around it is a smart-contract
+    project with a front end — the contracts hold the money, and a reviewer who
+    treats them as an implementation detail of the dashboard is reviewing the
+    wrong thing. Dependencies outrank file counts for the same reason: four
+    `.py` files that import `torch` are a model, and forty that import `django`
+    are an API, and the extension says neither.
+    """
+    kinds = []
+    for _label, kind in dependencies:
+        if kind not in kinds:
+            kinds.append(kind)
+
+    top_language = languages[0][0] if languages else ""
+    chain_languages = ("Solidity", "Vyper", "Cairo", "Move")
+
+    has_notebooks = False
+    for language, _count in languages:
+        if language == "Jupyter notebook":
+            has_notebooks = True
+            break
+
+    if top_language in chain_languages or "contracts" in kinds:
+        # Only when the chain code is actually present. A front end that talks
+        # to somebody else's deployed contract pulls in `ethers` and is not a
+        # contract project.
+        for language, _count in languages:
+            if language in chain_languages:
+                return "contracts"
+        if "Hardhat" in framework_labels or "Foundry" in framework_labels:
+            return "contracts"
+
+    if "ml" in kinds or has_notebooks:
+        return "ml"
+    if "mobile" in kinds or "Flutter" in framework_labels:
+        return "mobile"
+    if "frontend" in kinds and "backend" in kinds:
+        return "fullstack"
+    if "frontend" in kinds:
+        return "frontend"
+    if "backend" in kinds:
+        return "backend"
+    return "general"
+
+
+def _file_role(path: str) -> str:
+    """A short, honest label for what a file is, inferred from its path.
+
+    Deliberately structural — "UI component", "configuration module" — and never
+    functional. The tempting version of this reads `GMButton.jsx` and captions it
+    "wallet connect + on-chain transaction", which is a guess presented to the
+    model as a fact; if the file turned out to be an empty stub, the caption
+    would be arguing the freelancer's case for them. What a path genuinely
+    proves is where the author filed it.
+    """
+    lowered = path.lower()
+    segments = lowered.split("/")
+    name = segments[-1]
+    stem = name.rsplit(".", 1)[0]
+    parents = segments[:-1]
+
+    if name.startswith("readme"):
+        return "project README"
+    for directory in parents:
+        if directory in ("components", "component", "widgets"):
+            return "UI component"
+        if directory in ("pages", "page", "views", "screens", "routes"):
+            return "page or route"
+        if directory == "hooks":
+            return "reusable hook"
+        if directory in ("config", "configs", "settings"):
+            return "configuration module"
+        if directory in ("services", "api", "handlers", "controllers"):
+            return "service or request handler"
+        if directory in ("models", "schemas", "entities"):
+            return "data model"
+        if directory in ("utils", "helpers", "lib"):
+            return "utility module"
+        if directory in ("styles", "css"):
+            return "stylesheet"
+    if lowered.endswith(".css"):
+        return "stylesheet"
+    if lowered.endswith(".sol"):
+        return "smart contract"
+    if stem in ENTRY_FILENAMES:
+        return "application entry point"
+    return "source file"
+
+
+def _milestone_tokens(text: str) -> list:
+    """
+    Distinctive words from the milestone, for matching against file paths.
+
+    Returned as a SORTED LIST, never a set. Python hashes strings with a
+    per-process random seed, so iterating a set of strings yields a different
+    order on the leader than on a validator — and any ordering that reaches the
+    ranking key would make two honest nodes select different files and
+    fingerprint different evidence. Every collection on this path is ordered
+    explicitly for that reason.
+    """
+    lowered = ""
+    for char in str(text).lower():
+        lowered += char if (char.isalnum() or char == "-") else " "
+
+    seen = []
+    for word in lowered.split():
+        if len(word) < RELEVANCE_MIN_TOKEN or word in RELEVANCE_STOPWORDS:
+            continue
+        if word not in seen:
+            seen.append(word)
+    seen.sort()
+    return seen
+
+
+def _evidence_focus(milestone_desc: str, requirements: str) -> str:
+    """
+    The text that steers which files get read: the MILESTONE description alone.
+
+    The project-wide `requirements` are deliberately excluded despite being
+    available. They describe every milestone at once — CronPay's list runs from
+    "Solidity smart contracts" to "React dashboard" — so folding them in gives
+    each milestone the union of all of them and ranks by nothing in particular.
+    The milestone description is the only text that states what THIS submission
+    was supposed to deliver.
+
+    It is a named helper rather than an inline expression because the leader and
+    every validator must derive the identical string; two spellings of the same
+    idea in two places is precisely the drift that shows up as a false
+    fingerprint mismatch. `requirements` stays in the signature so the exclusion
+    is visible at the call site instead of looking like an oversight.
+    """
+    return str(milestone_desc)
+
+
+def _preferred_extensions(text: str) -> tuple:
+    """Extensions the milestone's own wording asks for.
+
+    A milestone naming Solidity or smart contracts wants `.sol`; one naming a
+    dashboard or React wants the front-end extensions. Checked in a fixed order
+    and returning the FIRST match rather than accumulating, so a milestone that
+    mentions both ("contracts deployed … source in a public repo") resolves to
+    the subject rather than to everything.
+    """
+    lowered = str(text).lower()
+    for keywords, extensions in RELEVANCE_EXTENSION_HINTS:
+        for keyword in keywords:
+            if keyword in lowered:
+                return extensions
+    return ()
+
+
+def _relevance(path: str, tokens: list, extensions: tuple, named: list = []) -> int:
+    """How well a path answers the milestone, 0 upwards. Higher ranks first.
+
+    Three independent signals, deliberately coarse — this decides *ordering*,
+    not a score, and a finely-tuned number here would be a second scoring system
+    nobody can audit.
+    """
+    lowered = path.lower()
+    score = 0
+
+    # The client named this file or directory outright. Worth more than every
+    # inference combined, and counted ONCE however many references match: a
+    # requirements block that says `contracts/Escrow.sol` three times has stated
+    # one fact, and letting it stack would rank by how often a client repeated
+    # themselves.
+    for reference in named:
+        if reference in lowered:
+            score += NAMED_PATH_WEIGHT
+            break
+
+    # The milestone named a language or layer, and this file is it.
+    if extensions and lowered.endswith(extensions):
+        score += RELEVANCE_EXTENSION_WEIGHT
+
+    # A word from the milestone appears in the path — `dispute`, `escrow`,
+    # `payroll`. Capped so a long requirements block cannot let one deep path
+    # outrank the language match itself.
+    hits = 0
+    for token in tokens:
+        if token in lowered:
+            hits += 1
+            if hits >= RELEVANCE_TOKEN_CAP:
+                break
+    return score + hits
+
+
+def _rank_source_files(entries: list, tokens: list = [], extensions: tuple = (),
+                       subpath: str = "", named: list = [],
+                       tests: bool = False) -> list:
+    """
+    The source files worth showing, best first.
+
+    Ordered by a total, deterministic key so the leader and every validator pick
+    the same files from the same tree:
+
+        (-relevance, tier, -size, path)
+
+    `relevance` is how well the path answers THIS milestone — the language it
+    named, and its own vocabulary appearing in the path. It leads because size
+    and tier are proxies for "probably important" while relevance is evidence
+    about the actual question. With no keywords supplied it is 0 for every
+    candidate and the key degrades exactly to the previous `(tier, -size, path)`.
+
+    `tier` puts real modules ahead of wrappers — feature directories first, then
+    files whose name is PascalCase (a component by convention even when it sits
+    outside one), then anything else, then conventional entry points last.
+    `-size` then prefers the larger file within a tier, on the assumption that
+    bytes are roughly where the logic is. `path` breaks remaining ties, and is
+    what makes the sort reproducible rather than merely stable: two validators
+    sorting the same tree must produce the same list, not just a consistent one.
+
+    `subpath` restricts candidates to the directory the client linked. Without
+    it, a `/tree/main/contracts` URL still walked the whole repository and the
+    largest files anywhere won — which is how a Solidity milestone was judged on
+    three React pages. See `_parse_github_repo`.
+
+    `named` carries the paths the requirements pointed at BY NAME, which
+    `_relevance` weights above every inference — see `NAMED_PATH_WEIGHT`.
+
+    `tests` switches the candidate filter from implementation to test files, so
+    pass 4 can rank tests by the same key rather than by a second copy of this
+    logic. Tests are otherwise excluded, and that default is right: they
+    describe the code rather than being it, and they are often the largest
+    files in a repository.
+
+    Ranking on size alone was never wrong so much as blind: it asks "what is the
+    biggest file here", when the question is "what did this milestone promise".
+    """
+    prefix = f"{subpath}/" if subpath else ""
+
+    candidates = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "blob":
+            continue
+
+        path = str(entry.get("path", ""))
+        if not path:
+            continue
+        if tests:
+            if not _is_test_source_path(path):
+                continue
+        elif not _is_source_path(path):
+            continue
+        if prefix and not path.startswith(prefix):
+            continue
+
+        try:
+            size = int(entry.get("size", 0))
+        except Exception:
+            continue
+        if size > MAX_FILE_BYTES:
+            continue
+
+        segments = path.split("/")
+        name = segments[-1]
+        stem = name.rsplit(".", 1)[0]
+        lowered_parents = [segment.lower() for segment in segments[:-1]]
+
+        if any(directory in FEATURE_DIRS for directory in lowered_parents):
+            tier = 0
+        elif stem.lower() in ENTRY_FILENAMES:
+            # Tested BEFORE the PascalCase rule, or `src/App.jsx` — the single
+            # most common wrapper there is — reads as a component on the strength
+            # of its capital A and takes a slot from real implementation.
+            tier = 3
+        elif stem[:1].isupper():
+            tier = 1
+        else:
+            tier = 2
+
+        candidates.append(
+            (-_relevance(path, tokens, extensions, named), tier, -size, path)
+        )
+
+    candidates.sort()
+
+    ranked = []
+    for _relevance_rank, _tier, _negative_size, path in candidates:
+        ranked.append(path)
+    return ranked
 
 
 def _looks_minified(text: str) -> bool:
@@ -734,63 +1883,146 @@ def _looks_minified(text: str) -> bool:
     return False
 
 
-def _rank_source_files(entries: list) -> list:
+def _find_readme(paths: list, subpath: str = "") -> str:
+    """Path of the shallowest README, or "" when the repo has none.
+
+    Under a linked subdirectory that directory's own README is preferred —
+    `contracts/` documents the contracts — and the repository root README is
+    the fallback, because that is where a monorepo states what the project as a
+    whole is for, which is what `requirements` are judged against.
     """
-    The source files worth showing, best first.
+    prefix = f"{subpath}/" if subpath else ""
+    scopes = (prefix, "") if prefix else ("",)
 
-    Sorted by depth then path so that the leader and every validator pick the
-    same files from the same tree. Files nearer the root come first: those are
-    the entry points and the code someone actually wrote, while depth usually
-    means generated, vendored or peripheral.
-    """
-    candidates = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("type", "")) != "blob":
-            continue
-
-        path = str(entry.get("path", ""))
-        if not path or not _is_source_path(path):
-            continue
-
-        try:
-            if int(entry.get("size", 0)) > MAX_FILE_BYTES:
+    for scope in scopes:
+        best = ""
+        best_depth = -1
+        for path in paths:
+            if scope and not path.startswith(scope):
                 continue
-        except Exception:
-            continue
+            if not path.lower().split("/")[-1].startswith("readme"):
+                continue
 
-        candidates.append((path.count("/"), path))
+            depth = path.count("/")
+            if best_depth == -1 or depth < best_depth or (
+                depth == best_depth and path < best
+            ):
+                best = path
+                best_depth = depth
 
-    candidates.sort()
-
-    ranked = []
-    for _depth, path in candidates:
-        ranked.append(path)
-    return ranked
+        if best:
+            return best
+    return ""
 
 
-def _find_readme(entries: list) -> str:
-    """Path of the shallowest README, or "" when the repo has none."""
-    best = ""
-    best_depth = -1
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("type", "")) != "blob":
-            continue
+def _find_manifests(paths: list, subpath: str = "") -> list:
+    """Dependency manifests in this tree, most-informative first.
 
-        path = str(entry.get("path", ""))
-        if not path:
-            continue
-        if not path.lower().split("/")[-1].startswith("readme"):
-            continue
+    Ordered by `MANIFEST_FILENAMES` rather than by where they sit, so a
+    repository holding both `package.json` and `requirements.txt` reports them
+    in the same order on every node. Within one filename the SHALLOWEST copy
+    wins, and under a linked subdirectory that subdirectory is searched first —
+    a `/tree/main/Frontend` submission is built from `Frontend/package.json`,
+    and the root manifest of a monorepo would describe somebody else's half.
 
-        depth = path.count("/")
-        if best_depth == -1 or depth < best_depth or (depth == best_depth and path < best):
-            best = path
-            best_depth = depth
-    return best
+    Returns at most `MAX_MANIFESTS` paths.
+    """
+    prefix = f"{subpath}/" if subpath else ""
+    # Scoped then whole-repo, so the subdirectory's own manifest is preferred
+    # without excluding a root-only one. Unscoped, the single "" sweep already
+    # covers the tree — running a second identical pass would only cost time.
+    scopes = (prefix, "") if prefix else ("",)
+
+    found = []
+    for filename in MANIFEST_FILENAMES:
+        if len(found) >= MAX_MANIFESTS:
+            break
+
+        for scope in scopes:
+            best = ""
+            best_depth = -1
+            for path in paths:
+                if scope and not path.startswith(scope):
+                    continue
+                if path.lower().split("/")[-1] != filename:
+                    continue
+                depth = path.count("/")
+                if best_depth == -1 or depth < best_depth or (
+                    depth == best_depth and path < best
+                ):
+                    best = path
+                    best_depth = depth
+
+            if best and best not in found:
+                found.append(best)
+                break
+
+    return found
+
+
+def _inventory_line(
+    total_files: int,
+    source_paths: list,
+    test_count: int,
+    languages: list,
+    frameworks: list,
+    dependencies: list,
+    kind: str,
+    shown: int,
+) -> str:
+    """What the repository IS, in one paragraph, ahead of the excerpt from it.
+
+    This is the difference between a reviewer who knows they are holding 12 of
+    78 source files in a Hardhat project and one who assumes the five files in
+    front of them are the whole deliverable. The second reviewer scores
+    `completeness` off an accident of ranking — which is exactly what produced
+    a 0/0/0/0 on a repository that met its milestone.
+
+    Every number here comes from the tree listing both sides fetched, so it is
+    the same paragraph on the leader and on every validator.
+    """
+    parts = []
+
+    language_bits = []
+    for language, count in languages[:MAX_INVENTORY_LANGUAGES]:
+        language_bits.append(f"{count} {language}")
+    if language_bits:
+        parts.append(
+            f"{total_files} files, {len(source_paths)} of them source "
+            f"({', '.join(language_bits)})."
+        )
+    else:
+        parts.append(f"{total_files} files, {len(source_paths)} of them source.")
+
+    if frameworks:
+        parts.append(f"Toolchain: {', '.join(frameworks)}.")
+
+    labels = []
+    for label, _kind in dependencies[:MAX_DEPENDENCIES]:
+        labels.append(label)
+    if labels:
+        parts.append(f"Declared dependencies: {', '.join(labels)}.")
+
+    if test_count:
+        parts.append(f"{test_count} test files present.")
+    else:
+        parts.append("No test files found anywhere in the tree.")
+
+    parts.append(f"Reviewed as: {KIND_NAMES.get(kind, 'general software')}.")
+
+    # Stated last and stated plainly, because it is the single fact most likely
+    # to be assumed wrongly: an excerpt reads as a whole repository unless it
+    # says otherwise.
+    if shown >= len(source_paths):
+        parts.append(f"All {shown} source files are shown below, in full.")
+    else:
+        parts.append(
+            f"{shown} of the {len(source_paths)} source files are shown below, "
+            f"selected as most relevant to THIS milestone — the rest exist and "
+            f"were not read."
+        )
+
+    return " ".join(parts)
 
 
 GITHUB_HEADERS = {
@@ -856,32 +2088,135 @@ def _is_transient_status(status: int) -> bool:
     return status == 0 or status == 403 or status == 429 or status >= 500
 
 
-def _fetch_github_code(github_url: str) -> str:
+def _list_repo_tree(owner: str, name: str, ref: str, pinned: str = "") -> list:
     """
-    Real source out of a GitHub repository: the README plus the first couple of
-    source files, each under a `// FILE:` header so the model can tell them
-    apart.
+    The repository's complete file listing — the inventory everything else reads.
 
-    Fails CLOSED. There is deliberately no fall back to rendering the page from
-    here, because this runs on the leader *and* on every validator: if one side
-    reached the API and another was rate-limited into rendering the landing
-    page instead, the two would fingerprint entirely different content and the
-    validator would reject honest evidence — reading as a dishonest leader
-    rather than as the network problem it is.
+    ONE metered call. `api.github.com` allows 60 requests per hour per IP while
+    `raw.githubusercontent.com` is unmetered, so this single request is the
+    entire quota cost of evaluating a submission, on the leader and on each
+    validator alike.
 
-    So a transient failure raises `[TRANSIENT]`, which `_compare_user_errors`
-    treats as agreement when both sides hit one, and the whole verification
-    reverts cleanly for the caller to retry. A 404 is different: every
-    validator sees it identically, so it raises `[EXTERNAL]`, which must match
-    exactly and does.
+    Retried only where a retry can help. Status 0 (the connection never
+    completed) and 5xx are blips that a second attempt commonly clears; 403 and
+    429 are the rate limit itself, and retrying a rate limit spends more quota
+    to be refused again — see `MAX_LISTING_RETRIES`. So a quota refusal raises
+    `[TRANSIENT]` immediately and the caller retries the whole verification
+    later, when the window has moved.
+
+    Raises rather than returning empty. A listing that cannot be read is not a
+    repository with no files in it, and scoring the difference as though it were
+    is how a freelancer gets rejected for GitHub being busy.
+    """
+    attempt = 0
+    while True:
+        result = _web_get(
+            f"https://api.github.com/repos/{owner}/{name}"
+            f"/git/trees/{ref}?recursive=1",
+            GITHUB_HEADERS,
+        )
+        status = int(result["status"])
+        if status == 200:
+            break
+
+        if attempt < MAX_LISTING_RETRIES and (status == 0 or status >= 500):
+            attempt += 1
+            continue
+
+        if _is_transient_status(status):
+            raise gl.vm.UserError(
+                f"{ERROR_TRANSIENT} GitHub returned {status} listing "
+                f"{owner}/{name}. Verify again."
+            )
+        # A pinned branch that does not exist is the one case where naming a
+        # branch is the actual diagnosis. Unpinned, `HEAD` resolved whatever the
+        # default is, so advice to "check the branch is main or master" would
+        # send the client after a problem they do not have. Both sides build
+        # this message from the URL alone, which matters: `_compare_user_errors`
+        # matches `[EXTERNAL]` exactly.
+        raise gl.vm.UserError(
+            f"{ERROR_EXTERNAL} Could not list {owner}/{name} — GitHub returned "
+            f"{status}. Check the repository is public"
+            + (f" and that branch `{pinned}` exists." if pinned else ".")
+        )
+
+    try:
+        parsed = json.loads(result["body"])
+    except Exception:
+        parsed = None
+
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("tree"), list):
+        raise gl.vm.UserError(
+            f"{ERROR_EXTERNAL} GitHub's file listing for {owner}/{name} could "
+            f"not be read."
+        )
+
+    return parsed["tree"][:MAX_TREE_ENTRIES]
+
+
+def _fetch_github_code(github_url: str, focus: str = "") -> dict:
+    """
+    Real source out of a GitHub repository, in the quantity that repository
+    warrants.
+
+    Four passes, in this order:
+
+    0. **Inventory** — one metered listing call. Everything below is decided
+       from it: how large the repository is, what languages are in it, what
+       toolchain it declares, and therefore how much of it to read.
+    1. **Context** — the README and up to `MAX_MANIFESTS` dependency manifests.
+       A manifest is where a project states what it is BUILT FROM, and "must use
+       OpenZeppelin" is checkable in one line of it and not checkable at all
+       from a ranked sample of source files.
+    2. **Implementation** — the files `_rank_source_files` puts first, up to the
+       plan's slot count.
+    3. **Tests** — only when the milestone asked for them (`_wants_tests`).
+
+    The size plan is the point of the ordering. `_plan_for` reads the source
+    count off the inventory and returns 18 slots at 6000 characters for a small
+    repository (effectively all of it, each file whole), 12 at 4000 for a medium
+    one, and 16 at 2600 for a large one — more files each shallower, because in
+    a 400-file system the question stops being "is this function well written"
+    and becomes "does this contain the pieces the milestone named", which is
+    answered by breadth.
+
+    The listing runs FIRST rather than as a fallback behind conventional-path
+    probes. Probing by convention spent up to six sequential round trips
+    guessing names the listing simply states, and it is what filled both of the
+    old two slots with `src/App.jsx` and `src/main.jsx` — an import list and a
+    provider tree — on a repository whose every requirement lived one directory
+    down. The quota cost is unchanged, because the listing was already
+    unconditional.
+
+    Fails CLOSED throughout. This runs on the leader AND on every validator: if
+    one side reached the API and another was rate-limited into rendering the
+    landing page instead, the two would fingerprint entirely different content
+    and the validator would reject honest evidence — reading as a dishonest
+    leader rather than as the network problem it is. So a transient failure
+    raises `[TRANSIENT]`, which `_compare_user_errors` treats as agreement when
+    both sides hit one, and the whole verification reverts cleanly for the
+    caller to retry. A 404 is different: every validator sees it identically, so
+    it raises `[EXTERNAL]`, which must match exactly and does.
+
+    Returns the evidence together with what it took to gather — the inventory
+    paragraph, the project kind, and how many of the planned slots were actually
+    filled, which is what `_gather_evidence` judges sufficiency from.
     """
     repo = _parse_github_repo(github_url)
     if not repo:
-        return ""
+        return {"text": "", "inventory": "", "kind": "", "planned": 0, "read": 0}
+
+    # What this milestone is about, in its own words. Derived here rather than
+    # passed in pre-computed so the leader and every validator run the SAME
+    # derivation over the SAME string — see `_milestone_tokens` on ordering.
+    tokens = _milestone_tokens(focus)
+    extensions = _preferred_extensions(focus)
+    named = _named_paths(focus)
 
     owner = str(repo["owner"])
     name = str(repo["repo"])
     pinned = str(repo["branch"])
+    subpath = str(repo.get("subpath", ""))
 
     # A `/tree/<branch>/` URL pins the branch the client actually linked; with
     # nothing pinned, `HEAD` resolves the repository's real default. Either way
@@ -894,7 +2229,7 @@ def _fetch_github_code(github_url: str) -> str:
 
         Raises on transient, returns "" on a plain 404. Untruncated so the
         caller can judge it before the budget cuts it down — see
-        `_looks_minified`.
+        `_looks_minified`. Unmetered, unlike the listing.
         """
         got = _web_get(
             f"https://raw.githubusercontent.com/{owner}/{name}/{ref}/{path}",
@@ -910,147 +2245,250 @@ def _fetch_github_code(github_url: str) -> str:
             return ""
         return str(got["body"])
 
+    # ── Pass 0: the inventory ─────────────────────────────────────────────────
+    tree = _list_repo_tree(owner, name, ref, pinned)
+
+    prefix = f"{subpath}/" if subpath else ""
+    repo_paths = []
+    scoped_paths = []
+    source_paths = []
+    test_paths = []
+    for entry in tree:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("type", "")) != "blob":
+            continue
+        path = str(entry.get("path", ""))
+        if not path:
+            continue
+
+        repo_paths.append(path)
+        if prefix and not path.startswith(prefix):
+            continue
+        scoped_paths.append(path)
+
+        # `_is_source_path` is readable-and-not-a-test, `_is_test_source_path`
+        # is readable-and-a-test, so the `elif` splits readable files cleanly
+        # and everything unreadable falls out of both counts.
+        if _is_source_path(path):
+            source_paths.append(path)
+        elif _is_test_source_path(path):
+            test_paths.append(path)
+
+    if not scoped_paths:
+        raise gl.vm.UserError(
+            f"{ERROR_EXTERNAL} {owner}/{name} contains no files"
+            + (f" under `{subpath}`." if subpath else ".")
+        )
+
+    plan = _plan_for(len(source_paths))
+    languages = _detect_languages(source_paths)
+    # Frameworks are read from the WHOLE tree rather than the linked
+    # subdirectory: a `/tree/main/contracts` submission is still built by the
+    # `hardhat.config.ts` in the repository root, and that is the fact worth
+    # reporting about it.
+    frameworks = _detect_frameworks(repo_paths)
+
+    slots = int(plan["files"])
+    per_file = int(plan["per_file"])
+    fetch_cap = int(plan["fetches"])
+    budget = int(plan["budget"])
+    if budget > CODE_TEXT_CHARS:
+        budget = CODE_TEXT_CHARS
+
     pieces = []
     used = 0
     accepted = 0
-    probes = 0
+    fetches = 0
     have_readme = False
+    template_readme = False
+    fetched_paths = []
 
-    # ── Pass 1: raw, by convention ──
-    #
-    # The README is fetched for context and is not a gate: whether it answers or
-    # 404s, the source probes below run against the same already-settled ref.
-    probes += 1
-    body = _raw(README_PATH)
-    if body:
-        chunk = f"// FILE: {README_PATH}\n{body[:README_CHARS]}"
+    def _add(path: str, body: str, room: int, limit: int) -> int:
+        """One file as a labelled chunk, returned as the characters it consumed.
+
+        The header carries the file's real length and a structural role, so the
+        model can tell a 300-character stub from a 4000-character implementation
+        it is only being shown part of. Truncation is announced for the same
+        reason: the old format cut a file mid-token with no marker, and an
+        excerpt that looks like a whole file reads as an unfinished one.
+
+        `body` is always the WHOLE file so the reported length is the real one;
+        `limit` is this file's slice of the budget, and comes from the size plan
+        rather than from a constant — the same 4000-character file is shown
+        whole in a small repository and truncated in a large one.
+
+        Lines are numbered from 1, and because the excerpt is always the file's
+        HEAD the numbers are the file's real ones — a citation to L142 can be
+        opened in the repository and checked. Truncating from the head rather
+        than from anywhere more clever is what preserves that property.
+        """
+        shown = body[:limit]
+        cut = f" — showing first {len(shown)}" if len(shown) < len(body) else ""
+        header = f"// FILE: {path} ({len(body)} chars, {_file_role(path)}{cut})"
+
+        numbered = []
+        line_no = 0
+        for line in shown.split("\n"):
+            line_no += 1
+            numbered.append(f"{str(line_no).rjust(LINE_NUMBER_WIDTH)}| {line}")
+
+        chunk = f"{header}\n" + "\n".join(numbered)
+        chunk = chunk[:room]
         pieces.append(chunk)
-        used += len(chunk)
-        have_readme = True
+        fetched_paths.append(path)
+        return len(chunk)
 
-    for path in RAW_PROBE_PATHS:
-        if accepted >= MAX_SOURCE_FILES or probes >= MAX_RAW_PROBES:
-            break
-        room = CODE_TEXT_CHARS - used
+    # ── Pass 1: context — the README, then the manifests ──────────────────────
+    readme_path = _find_readme(repo_paths, subpath)
+    if readme_path:
+        body = _raw(readme_path)
+        if body:
+            if _is_template_readme(body):
+                # Scaffold boilerplate. Skipped rather than truncated into the
+                # evidence, which is what spent a quarter of the old budget on
+                # `npm create vite`'s notes about Oxc and SWC — see
+                # `TEMPLATE_README_MARKERS`. The room for the note that replaces
+                # it is reserved out of the budget here, not deducted later.
+                template_readme = True
+                fetched_paths.append(readme_path)
+                budget = budget - len(NO_README_NOTE) - 2
+            else:
+                used += _add(readme_path, body, budget - used, README_CHARS)
+                have_readme = True
+
+    manifest_text = ""
+    for path in _find_manifests(repo_paths, subpath):
+        room = budget - used
         if room <= 0:
             break
+        body = _raw(path)
+        if not body:
+            continue
 
-        probes += 1
+        # Kept WHOLE for detection and truncated only for display. The token
+        # that identifies the project — `torch`, `openzeppelin` — can sit past
+        # the display cap in a manifest with 200 transitive pins, and reading it
+        # costs nothing once the file has been fetched.
+        manifest_text += "\n" + body
+        used += _add(path, body, room, MANIFEST_CHARS)
+
+    dependencies = _detect_dependencies(manifest_text)
+    kind = _project_kind(languages, dependencies, frameworks)
+
+    # ── Pass 2: implementation, ranked against this milestone ─────────────────
+    ranked = _rank_source_files(tree, tokens, extensions, subpath, named)
+    planned = slots if slots < len(ranked) else len(ranked)
+
+    for path in ranked:
+        if accepted >= slots or fetches >= fetch_cap:
+            break
+        room = budget - used
+        if room <= 0:
+            break
+        # Already in `pieces` as context; fetching again would buy a duplicate
+        # with a source slot.
+        if path in fetched_paths:
+            continue
+
+        fetches += 1
         body = _raw(path)
         if not body or _looks_minified(body):
             continue
 
-        chunk = f"// FILE: {path}\n{body}"[:room]
-        pieces.append(chunk)
-        used += len(chunk)
+        used += _add(path, body, room, per_file)
         accepted += 1
 
-    # ── Pass 2: the listing API, only when convention found no SOURCE ──
+    # ── Pass 3: tests, only when the milestone asked for them ─────────────────
     #
-    # The gate is `accepted == 0`, NOT an empty `pieces`. A README is not code.
-    # Gating on `pieces` meant any repository that had a README but kept its
-    # source somewhere the probe list does not guess was declared complete on
-    # the strength of its prose, and the model was asked for a `code_quality`
-    # score having been shown no code — which is job 16: functionality 72,
-    # completeness 68, code_quality 0, rejected at 45, on evidence no validator
-    # ever saw. Django (`<app>/views.py`), Rails (`app/models/`), Maven
-    # (`src/main/java/...`), pnpm/turbo monorepos (`packages/*/src/`) and Go's
-    # `cmd/server/main.go` all land there, so this was not an edge case.
-    #
-    # ONE call. This is the expensive path in the only sense that matters:
-    # api.github.com meters at 60 requests per hour per IP, and validator nodes
-    # share busy egress addresses, so in practice it returns 403 regardless of
-    # how little this contract asks of it. raw.githubusercontent.com is not
-    # subject to that limit, which is why every request above prefers it.
-    if accepted == 0:
-        result = _web_get(
-            f"https://api.github.com/repos/{owner}/{name}"
-            f"/git/trees/{ref}?recursive=1",
-            GITHUB_HEADERS,
-        )
-        status = int(result["status"])
+    # Excluded by default and that default is right — a test file is often the
+    # largest thing in a repository and would win slots from the code it tests.
+    # But "must include unit tests with 90% coverage" is a requirement like any
+    # other, and judging it from an excerpt that deliberately excluded tests is
+    # the same failure as scoring code_quality off a repository landing page.
+    if test_paths and _wants_tests(focus):
+        taken = 0
+        for path in _rank_source_files(
+            tree, tokens, extensions, subpath, named, True
+        ):
+            if taken >= MAX_TEST_FILES or fetches >= fetch_cap:
+                break
+            room = budget - used
+            if room <= 0:
+                break
+            if path in fetched_paths:
+                continue
 
-        if status == 200:
-            try:
-                parsed = json.loads(result["body"])
-            except Exception:
-                parsed = None
+            fetches += 1
+            body = _raw(path)
+            if not body or _looks_minified(body):
+                continue
 
-            if isinstance(parsed, dict) and isinstance(parsed.get("tree"), list):
-                tree = parsed["tree"]
-
-                # Only when pass 1 did not already supply one, or a repository
-                # holding both `README.md` and `README.rst` would spend a fetch
-                # and a chunk of the budget on the same prose twice.
-                if not have_readme:
-                    readme_path = _find_readme(tree)
-                    if readme_path:
-                        body = _raw(readme_path)
-                        if body:
-                            chunk = f"// FILE: {readme_path}\n{body[:README_CHARS]}"
-                            pieces.append(chunk)
-                            used += len(chunk)
-                            have_readme = True
-
-                fetches = 0
-                for path in _rank_source_files(tree):
-                    if accepted >= MAX_SOURCE_FILES or fetches >= MAX_LISTING_FETCHES:
-                        break
-                    room = CODE_TEXT_CHARS - used
-                    if room <= 0:
-                        break
-
-                    fetches += 1
-                    body = _raw(path)
-                    if not body or _looks_minified(body):
-                        continue
-
-                    chunk = f"// FILE: {path}\n{body}"[:room]
-                    pieces.append(chunk)
-                    used += len(chunk)
-                    accepted += 1
-
-        elif _is_transient_status(status):
-            # No source was read by either route, so there is nothing to score
-            # `code_quality` against and the call must not proceed. Raising here
-            # can now discard a README that pass 1 did fetch, and that is the
-            # point: reverting a verification is retryable, whereas scoring
-            # prose as code rejects a milestone permanently and wrongly.
-            #
-            # The cost is that a leader who reaches the listing while a
-            # validator is rate-limited gets a mismatch — the validator raises
-            # while the leader succeeded — and the transaction reverts for the
-            # caller to retry. That trade is deliberate: a retry costs time, a
-            # false rejection costs the freelancer the milestone.
-            raise gl.vm.UserError(
-                f"{ERROR_TRANSIENT} GitHub returned {status} listing "
-                f"{owner}/{name}, and no source file could be read directly. "
-                f"Verify again."
-            )
+            used += _add(path, body, room, per_file)
+            taken += 1
 
     if not pieces:
         # Every route came back a clean 404. Deterministic, so validators agree
         # — and far more honest than handing the prompt an empty repository and
         # letting the model score the silence.
+        #
+        # Tested BEFORE the note is attached, or a repository whose only readable
+        # file was a scaffold README would return the note as its evidence: a
+        # non-empty `code_text` holding no code at all, which `_gather_evidence`
+        # would wave through and the model would be asked to score.
         raise gl.vm.UserError(
             f"{ERROR_EXTERNAL} Could not read any file from {owner}/{name}. "
             f"Check the repository is public"
             + (f" and that branch `{pinned}` exists." if pinned else ".")
         )
 
-    return "\n\n".join(pieces)[:CODE_TEXT_CHARS]
+    text = "\n\n".join(pieces)[:budget]
+
+    if template_readme and not have_readme:
+        # Attached AFTER truncation, against the room reserved out of `budget`
+        # when the template was detected. Appending before the cut left the note
+        # to be shaved by the separators that `used` never counted — the tail of
+        # the sentence disappeared and the absence went unstated again.
+        text = text + "\n\n" + NO_README_NOTE
+
+    return {
+        "text": text,
+        "inventory": _inventory_line(
+            len(scoped_paths),
+            source_paths,
+            len(test_paths),
+            languages,
+            frameworks,
+            dependencies,
+            kind,
+            accepted,
+        ),
+        "kind": kind,
+        "planned": planned,
+        "read": accepted,
+    }
 
 
-def _gather_evidence(github_url: str, site_url: str) -> dict:
+def _gather_evidence(github_url: str, site_url: str, focus: str = "") -> dict:
     """
     Fetch the text evidence. No LLM — this is the half a validator can afford.
 
     Screenshots are not fetched here and not fingerprinted: they are bytes that
     differ between any two renders, so they cannot be compared, and they exist
     only to feed the design-match prompt.
+
+    `focus` is the milestone text that steers file ranking. It is part of what
+    the evidence IS, not a presentation detail: two nodes passing different
+    focus strings would select different files, fingerprint different content,
+    and the validator would read an honest leader as a liar. Both call sites
+    therefore pass the same value, built the same way — see `verify_milestone`.
     """
     code_text = ""
     site_text = ""
+    inventory = ""
+    kind = ""
+    planned = 0
+    read = 0
     if github_url:
         # The two paths are chosen by the URL alone, never by whether a fetch
         # succeeded. That is what keeps the leader and every validator on the
@@ -1059,7 +2497,12 @@ def _gather_evidence(github_url: str, site_url: str) -> dict:
         # the API, and the resulting fingerprint mismatch would look like a
         # lying leader instead of a busy network.
         if _parse_github_repo(github_url):
-            code_text = _fetch_github_code(github_url)
+            fetched = _fetch_github_code(github_url, focus)
+            code_text = str(fetched["text"])
+            inventory = str(fetched["inventory"])
+            kind = str(fetched["kind"])
+            planned = int(fetched["planned"])
+            read = int(fetched["read"])
         else:
             # Not GitHub — GitLab, Bitbucket, a self-hosted forge. Render the
             # page, which is what every side does here, so they still agree.
@@ -1077,10 +2520,23 @@ def _gather_evidence(github_url: str, site_url: str) -> dict:
     return {
         "code_text": code_text,
         "site_text": site_text,
+        # What the repository IS, alongside an excerpt OF it. Carried separately
+        # rather than prepended to `code_text` because the fingerprint is the
+        # HEAD of the evidence: a paragraph of inventory in front of it would
+        # make every repository with the same stack fingerprint alike and hand
+        # away the swap check that is the validator's whole job.
+        "inventory": inventory,
+        "kind": kind,
+        "planned": planned,
+        "read": read,
         "code_len": len(_normalize(code_text)),
         "site_len": len(_normalize(site_text)),
         "code_fp": _fingerprint(code_text),
         "site_fp": _fingerprint(site_text),
+        # Fingerprinted in its own right so a leader cannot bias the review by
+        # describing a repository it did not read — the counts and the project
+        # kind come off the tree listing every validator fetches too.
+        "inv_fp": _fingerprint(inventory),
     }
 
 
@@ -1104,7 +2560,7 @@ def _gather_and_score(
     reach the leader, and anything storage-backed kills the block before it
     runs.
     """
-    ev = _gather_evidence(github_url, site_url)
+    ev = _gather_evidence(github_url, site_url, _evidence_focus(milestone_desc, requirements))
 
     # Screenshots are the most expensive fetch, so take them only when there is
     # actually a mockup to compare against.
@@ -1137,6 +2593,8 @@ def _gather_and_score(
     scores["site_len"] = int(ev["site_len"])
     scores["code_fp"] = str(ev["code_fp"])
     scores["site_fp"] = str(ev["site_fp"])
+    scores["inv_fp"] = str(ev["inv_fp"])
+    scores["kind"] = str(ev["kind"])
     return scores
 
 
@@ -1166,6 +2624,14 @@ def _evidence_matches(leader_scores: dict, own_evidence: dict) -> bool:
     if str(leader_scores.get("code_fp", "")) != str(own_evidence["code_fp"]):
         return False
     if str(leader_scores.get("site_fp", "")) != str(own_evidence["site_fp"]):
+        return False
+    # The inventory steers the review — how much of the repository the excerpt
+    # is, and which criteria `_kind_guidance` supplies — so it is part of the
+    # evidence, not a presentation detail. Both sides derive it from the same
+    # tree listing, so it compares exactly rather than within a tolerance.
+    if str(leader_scores.get("inv_fp", "")) != str(own_evidence["inv_fp"]):
+        return False
+    if str(leader_scores.get("kind", "")) != str(own_evidence["kind"]):
         return False
     if not _lengths_agree(
         int(leader_scores.get("code_len", -1)), int(own_evidence["code_len"])
@@ -1302,6 +2768,7 @@ class ProofWork(gl.Contract):
                 functionality_score=u32(0),
                 completeness_score=u32(0),
                 final_score=u32(0),
+                reasoning="",
             )
 
         return job_id
@@ -1466,6 +2933,12 @@ class ProofWork(gl.Contract):
         live_url = site_url if has_site else ""
         design_url = mockup_url if has_mockup else ""
 
+        # Plain str, computed once, captured by the validator closure below —
+        # it is cloudpickled to reach every node, and it must be byte-identical
+        # to what `_gather_and_score` derives on the leader or the two select
+        # different files and fingerprint different evidence.
+        focus = _evidence_focus(milestone_desc, requirements)
+
         # ── One consensus round for all four scores ──
         #
         # This used to be four `prompt_non_comparative` blocks run back to
@@ -1499,7 +2972,7 @@ class ProofWork(gl.Contract):
                 # here without costing an LLM call.
                 #
                 # If we succeed where the leader failed, that IS disagreement.
-                _gather_evidence(code_url, live_url)
+                _gather_evidence(code_url, live_url, focus)
                 return False
 
             leader_scores = leader_result.calldata
@@ -1513,7 +2986,7 @@ class ProofWork(gl.Contract):
 
             # Re-fetch the evidence — NOT the scoring. See the note on
             # EVIDENCE_FINGERPRINT_CHARS for why the LLM call is not repeated.
-            own_evidence = _gather_evidence(code_url, live_url)
+            own_evidence = _gather_evidence(code_url, live_url, focus)
             return _evidence_matches(leader_scores, own_evidence)
 
         scores = gl.vm.run_nondet(
@@ -1542,6 +3015,11 @@ class ProofWork(gl.Contract):
         ms.functionality_score = func_s
         ms.completeness_score = comp_s
         ms.final_score = final
+        # `scores` came through consensus, but this key rode along unvalidated
+        # by design — see `_extract_scores`. Re-cut the length here rather than
+        # trusting the value: the block's output is only as bounded as whatever
+        # the leader put in it.
+        ms.reasoning = str(scores.get("reasoning", ""))[:REASONING_CHARS]
 
         # ── Determine payment based on score ──
         # Same threshold the validator gates on, deliberately — if these two
@@ -1744,6 +3222,10 @@ class ProofWork(gl.Contract):
                     "completeness": int(ms.completeness_score),
                     "final_weighted": int(ms.final_score),
                 },
+                # The reviewer's own account of what it read, with file and line
+                # citations. Present so a reader can OPEN the cited lines and
+                # check them — it is the leader's claim, not a verified fact.
+                "reasoning": ms.reasoning,
             }
         )
 
