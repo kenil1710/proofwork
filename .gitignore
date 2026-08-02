@@ -31,6 +31,13 @@ keystore*.json
 # Regenerate with test/README.md rather than committing them.
 test/.accounts.json
 
+# Throwaway probes — one-off scripts written to answer a single question while
+# debugging. They hardcode job ids and addresses from whichever deploy was live
+# at the time, so they rot immediately. The real harnesses live alongside them
+# without the underscore.
+test/_*.mjs
+test/dump-submission.mjs
+
 # Editors
 .idea/
 .vscode/
