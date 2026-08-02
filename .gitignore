@@ -42,3 +42,11 @@ test/dump-submission.mjs
 .idea/
 .vscode/
 *.swp
+
+# Local agent/assistant tooling config. Machine-specific developer setup in the
+# same category as .vscode/ and .idea/ below — it configures an editor, not the
+# project, and is of no use to anyone cloning this repo.
+CLAUDE.md
+AGENTS.md
+.claude/
+HANDOVER.md

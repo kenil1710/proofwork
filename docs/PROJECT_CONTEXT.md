@@ -2,7 +2,7 @@
 
 > **What this file is.** A single self-contained briefing on ProofWork: what it is, what
 > is built, what works, what is broken, and what comes next. Written to be handed to a
-> fresh assistant or collaborator who has never seen the repo. Everything here was
+> new collaborator who has never seen the repo. Everything here was
 > verified against the code on **2026-07-26** — where something is unverified or
 > suspected, it says so explicitly.
 
@@ -37,7 +37,7 @@ version control — not features.
 | Live deployment | ✅ https://proofwork-opal.vercel.app |
 | Integration tests | ⚠️ Main suite broken against current ABI — see §9 |
 | Git version control | ❌ **Zero commits. No remote. Everything untracked.** |
-| Docs (`README.md`, `CLAUDE.md`) | ⚠️ Stale — predate the anti-scam layer |
+| Docs (`README.md`) | ⚠️ Stale — predate the anti-scam layer |
 | Escrow remainder on 70–89% jobs | ❌ **Permanently locked — see §10** |
 
 **Honest summary:** the software is in substantially better shape than the documentation
@@ -66,7 +66,6 @@ swap both lines together.
 
 ```
 proofwork/
-├── CLAUDE.md                    # Build instructions + hard-won "DO NOT" list
 ├── README.md                    # Public project README (STALE — see §10)
 ├── contracts/
 │   └── proof_work.py            # The Intelligent Contract — 1061 lines
@@ -463,9 +462,9 @@ It predates the anti-scam layer entirely:
 - **Links section is still `[TBD]`** despite a live deployment at
   `https://proofwork-opal.vercel.app`
 
-### 🟡 `CLAUDE.md` is stale in the way that has already cost work
+### 🟡 The method table the tests were written from is stale
 
-`test/run.mjs` was written from `CLAUDE.md`'s method table and is now dead because of it.
+`test/run.mjs` was written from an older method table and is now dead because of it.
 Specifically stale: `create_job` shown with 4 args; `accept_job` shown as non-payable with no
 stake note; no `abandon_job` row; `get_job` shown returning 8 keys (it returns 14); the SDK
 snippets hand-roll a chain object and use `waitForTransactionReceipt` (the code deliberately
@@ -486,7 +485,7 @@ feature.
 
 ### 🟡 The weight table is documented four different ways
 
-`README.md` says a flat 25/25/25/25. `CLAUDE.md` gives a table with asterisks and
+`README.md` says a flat 25/25/25/25. The contract computes a table with asterisks and
 slash-alternatives. `docs/USER_GUIDE.md` gives a table whose last row is **mislabelled** — it
 calls `0/30/40/30` "Site only (no code)", but that branch is reached only when a **mockup** is
 present. Genuine site-only (no GitHub, no mockup) falls through to `0/0/50/50`, which is
@@ -601,7 +600,7 @@ unknown key reads as **zeroed rather than erroring**, so a lowercase address sil
 
 ## 11. Hard constraints — do not break these
 
-These are all in `CLAUDE.md`'s DO-NOT list and encoded as comments in the contract. Each one
+These are all encoded as comments in the contract. Each one
 cost real debugging time.
 
 1. **Line 1 of `proof_work.py` must be the runner pin**, nothing above it. A comment on
@@ -624,7 +623,7 @@ cost real debugging time.
    overflows u64 once the operand passes `u64_max/100`.
 8. **New `Job` fields go at the end.** Storage layout is positional.
 9. **Do not use deprecated GenLayer APIs** — `gl.get_webpage`, `gl.exec_prompt`,
-   `gl.eq_principle_strict_eq` are all gone. The `simulator` chain name in `CLAUDE.md` is
+   `gl.eq_principle_strict_eq` are all gone. The `simulator` chain name is
    also gone; the exports are `studionet` / `localnet` / `testnetBradbury`.
 10. **`isDecidedState()` is broken in genlayer-js 1.1.8** — it returns false for every input
     including `"ACCEPTED"`, so a loop using it never exits. And do **not** treat
@@ -715,8 +714,6 @@ Ordered by value. None of these are new features — the protocol is done.
 
 ### Short term
 
-5. **Refresh `CLAUDE.md`.** Its stale method table already caused the broken test suite; it
-   will cause the next one too.
 6. **Remove the appeals claims** from `README.md` and `docs/USER_GUIDE.md`, or build an
    appeals surface. Right now the docs promise a feature the product does not have.
 7. **Fix the mislabelled weight row** in `docs/USER_GUIDE.md` and document the genuine
